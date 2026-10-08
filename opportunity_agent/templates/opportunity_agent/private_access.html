@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+{% block title %}Private access | Opportunity Hub{% endblock %}
+{% block content %}
+<section class="auth-shell">
+  <div class="auth-card" style="max-width:560px; margin:48px auto;">
+    <div class="eyebrow">PRIVATE ACCESS</div>
+    <h1>Website access is currently private</h1>
+    <p class="subtitle">This website is hidden from unauthorized visitors. Please use an authorized private link provided by the administrator.</p>
+    {% if error %}
+      <div class="alert danger" style="margin-bottom: 16px;">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="{% url 'private_access' %}">
+      {% csrf_token %}
+      {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+      <label for="token" class="field-label">Private access token</label>
+      <input id="token" name="token" type="text" placeholder="Paste your private access link token" required>
+      <button type="submit" class="button" style="width:100%; margin-top:16px;">Continue to website</button>
+    </form>
+    <p class="muted" style="margin-top: 16px;">If you do not have a valid private access link, please contact the site administrator.</p>
+  </div>
+</section>
+{% endblock %}

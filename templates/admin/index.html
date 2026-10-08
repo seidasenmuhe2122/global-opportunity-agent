@@ -1,0 +1,155 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+{% block content %}
+<style>
+  .oa-dashboard { color: var(--body-fg, #f1f5f9); }
+  .oa-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin:0 0 22px; }
+  .oa-card { display:block; min-height:112px; padding:18px; border:1px solid #294066; border-radius:14px; background:linear-gradient(145deg,#101d37,#17294a); color:inherit!important; text-decoration:none!important; box-shadow:0 8px 24px #07101f33; }
+  .oa-card:hover { border-color:#69a6e8; transform:translateY(-1px); }
+  .oa-label { color:#9fb2d1; font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+  .oa-value { margin:8px 0 5px; color:#fff; font-size:30px; font-weight:750; line-height:1.1; }
+  .oa-note { color:#93a8c8; font-size:12px; }
+  .oa-layout { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr); gap:16px; margin-bottom:20px; }
+  .oa-panel { padding:20px; border:1px solid #294066; border-radius:14px; background:linear-gradient(145deg,#0d1930,#142342); }
+  .oa-panel h2 { margin:0 0 14px; color:#f5f8ff; font-size:19px; }
+  .oa-status { display:flex; align-items:center; gap:10px; margin:8px 0 15px; font-size:22px; font-weight:700; }
+  .oa-dot { width:10px; height:10px; border-radius:50%; background:#48d597; box-shadow:0 0 12px #48d59788; }
+  .oa-detail { display:flex; justify-content:space-between; gap:12px; padding:9px 0; border-top:1px solid #ffffff12; color:#b4c3dc; }
+  .oa-detail strong { color:#f4f7fc; text-align:right; }
+  .oa-actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:16px; }
+  .oa-actions a { padding:8px 12px; border:1px solid #385584; border-radius:8px; color:#cce2ff!important; text-decoration:none!important; }
+  .oa-actions a:hover { background:#1b3154; }
+  .oa-assistant-callout { display:flex; align-items:center; justify-content:space-between; gap:18px; margin-bottom:20px; padding:20px; border:1px solid #4267a1; border-radius:14px; background:linear-gradient(110deg,#14294b,#211947); }
+  .oa-assistant-callout h2 { margin:0 0 5px; color:#f5f8ff; font-size:20px; }
+  .oa-assistant-callout p { margin:0; color:#b4c3dc; }
+  .oa-assistant-button { flex:0 0 auto; padding:10px 16px; border-radius:9px; background:#527cff; color:#fff!important; font-weight:700; text-decoration:none!important; }
+  .oa-assistant-button:hover { background:#6b8eff; }
+  .oa-settings-callout { display:flex; align-items:center; justify-content:space-between; gap:18px; margin-bottom:20px; padding:20px; border:1px solid #4267a1; border-radius:14px; background:linear-gradient(110deg,#14294b,#183a36); }
+  .oa-settings-callout h2 { margin:0 0 5px; color:#f5f8ff; font-size:20px; }
+  .oa-settings-callout p { margin:0; color:#b4c3dc; }
+  .oa-settings-button { flex:0 0 auto; padding:10px 16px; border-radius:9px; background:#23896d; color:#fff!important; font-weight:700; text-decoration:none!important; }
+  .oa-settings-button:hover { background:#2aa881; }
+  .oa-error { color:#ff9b9b!important; }
+  @media (max-width:760px) { .oa-layout { grid-template-columns:1fr; } .oa-assistant-callout, .oa-settings-callout { align-items:flex-start; flex-direction:column; } }
+</style>
+<div class="oa-dashboard">
+  {% if perms.opportunity_agent.manage_security_settings or user.is_superuser %}
+  <section class="oa-settings-callout" aria-labelledby="oa-settings-heading">
+    <div>
+      <h2 id="oa-settings-heading">Website Settings</h2>
+      <p>Manage public/private visibility and open/approval registration independently.</p>
+    </div>
+    <a class="oa-settings-button" href="{% url 'admin_dashboard' %}#website-settings">Open Website Settings</a>
+  </section>
+  {% endif %}
+  {% if perms.opportunity_agent.view_aiconversation %}
+  <section class="oa-assistant-callout" aria-labelledby="oa-assistant-heading">
+    <div>
+      <h2 id="oa-assistant-heading">AI Assistant</h2>
+      <p>Open the assistant workspace to chat and manage your opportunity conversations.</p>
+    </div>
+    <a class="oa-assistant-button" href="{% url 'ai_chat' %}">Open AI Assistant</a>
+  </section>
+  {% endif %}
+  {% if admin_metrics %}
+  <div class="oa-grid">
+    <a class="oa-card" href="/admin/auth/user/">
+      <div class="oa-label">Total users</div>
+      <div class="oa-value">{{ admin_metrics.users }}</div>
+      <div class="oa-note">{{ admin_metrics.active_users }} active</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/source/">
+      <div class="oa-label">Total sources</div>
+      <div class="oa-value">{{ admin_metrics.sources }}</div>
+      <div class="oa-note">{{ admin_metrics.active_sources }} active</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/opportunity/">
+      <div class="oa-label">Opportunities today</div>
+      <div class="oa-value">{{ admin_metrics.opportunities_today }}</div>
+      <div class="oa-note">Discovered since midnight</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/opportunity/">
+      <div class="oa-label">Opportunities this week</div>
+      <div class="oa-value">{{ admin_metrics.opportunities_week }}</div>
+      <div class="oa-note">Last 7 calendar days</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/application/">
+      <div class="oa-label">Applications today</div>
+      <div class="oa-value">{{ admin_metrics.applications_today }}</div>
+      <div class="oa-note">Created since midnight</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/application/?status__exact=submitted">
+      <div class="oa-label">Submitted</div>
+      <div class="oa-value">{{ admin_metrics.submitted }}</div>
+      <div class="oa-note">Confirmed submissions</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/application/?status__exact=rejected">
+      <div class="oa-label">Rejected</div>
+      <div class="oa-value">{{ admin_metrics.rejected }}</div>
+      <div class="oa-note">Application decisions</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/application/?status__exact=failed">
+      <div class="oa-label">Failed</div>
+      <div class="oa-value">{{ admin_metrics.failed }}</div>
+      <div class="oa-note">Requires attention</div>
+    </a>
+    <a class="oa-card" href="/admin/opportunity_agent/application/?status__exact=needs_review">
+      <div class="oa-label">Needs review</div>
+      <div class="oa-value">{{ admin_metrics.needs_review }}</div>
+      <div class="oa-note">Manual action required</div>
+    </a>
+  </div>
+
+  <div class="oa-layout">
+    <section class="oa-panel">
+      <h2>Automation</h2>
+      <div class="oa-status"><span class="oa-dot"></span>{{ admin_metrics.automation_status }}</div>
+      <div class="oa-detail">
+        <span>Latest cycle</span>
+        <strong>
+          {% if admin_metrics.latest_run %}
+            {{ admin_metrics.latest_run.get_status_display }} · {{ admin_metrics.latest_run.started_at|date:"M j, H:i" }}
+          {% else %}No cycle recorded{% endif %}
+        </strong>
+      </div>
+      <div class="oa-detail">
+        <span>Last successful cycle</span>
+        <strong>
+          {% if admin_metrics.last_successful_run %}
+            {{ admin_metrics.last_successful_run.started_at|date:"M j, H:i" }}
+          {% else %}None yet{% endif %}
+        </strong>
+      </div>
+      <div class="oa-actions">
+        <a href="/admin/opportunity_agent/automationrun/">Automation history</a>
+        <a href="/admin/opportunity_agent/application/">Application queue</a>
+      </div>
+    </section>
+
+    <section class="oa-panel">
+      <h2>Source health</h2>
+      <div class="oa-detail">
+        <span>Source errors</span>
+        <strong class="{% if admin_metrics.source_errors %}oa-error{% endif %}">{{ admin_metrics.source_errors }}</strong>
+      </div>
+      <div class="oa-detail"><span>Web sources</span><strong>{{ admin_metrics.web_sources }} total · {{ admin_metrics.active_web_sources }} active</strong></div>
+      <div class="oa-detail"><span>Telegram sources</span><strong>{{ admin_metrics.telegram_sources }} total · {{ admin_metrics.active_telegram_sources }} active</strong></div>
+      <div class="oa-actions">
+        <a href="/admin/opportunity_agent/source/">Website sources</a>
+        <a href="/admin/opportunity_agent/telegramsource/">Telegram sources</a>
+        <a href="/admin/opportunity_agent/telegramdestination/">Telegram groups</a>
+        <a href="/admin/opportunity_agent/auditlog/">Audit logs</a>
+      </div>
+    </section>
+  </div>
+  {% endif %}
+
+  {% if app_list %}
+  <div id="content-main">
+    <div class="app-list">{% include "admin/app_list.html" with app_list=app_list show_changelinks=True %}</div>
+  </div>
+  {% else %}
+  <p>No applications are available.</p>
+  {% endif %}
+</div>
+{% endblock %}

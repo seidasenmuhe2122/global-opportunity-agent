@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}AI Assistant · Opportunity Hub{% endblock %}
+{% block breadcrumb %}AI Assistant{% endblock %}
+{% block content %}
+<style>
+.assistant-layout{display:grid;grid-template-columns:250px minmax(0,1fr);gap:16px;min-height:calc(100vh - 150px)}
+.assistant-sidebar,.assistant-panel{background:linear-gradient(145deg,#111a38,#0b1229);border:1px solid #23325b;border-radius:16px;overflow:hidden}
+.assistant-sidebar{padding:14px}.assistant-side-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.assistant-side-head h2{font-size:13px;margin:0}.assistant-new{border:1px solid #34518d;background:#16254a;color:#dce9ff;border-radius:8px;padding:7px 10px;cursor:pointer}
+.assistant-conversations{display:grid;gap:5px}.assistant-conversation{display:block;text-decoration:none;color:#9dafd4;border-radius:8px;padding:10px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.assistant-conversation:hover,.assistant-conversation.active{background:#18264d;color:#fff}
+.assistant-panel{display:flex;flex-direction:column;min-height:620px}.assistant-head{padding:18px 21px;border-bottom:1px solid #223154}.assistant-head h1{font-size:18px;margin:0 0 5px}.assistant-head p{color:#8193ba;font-size:11px;margin:0}.assistant-messages{flex:1;overflow:auto;display:flex;flex-direction:column;gap:15px;padding:22px}.assistant-message{max-width:min(780px,90%);border:1px solid #24345e;border-radius:14px;padding:13px 15px;background:#101b38;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.assistant-message.user{align-self:flex-end;background:#152b56;border-color:#345797}.assistant-message.assistant{align-self:flex-start}.assistant-message .role{display:block;color:#77dfff;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}.assistant-message .status{display:block;color:#8193ba;font-size:10px;margin-top:8px}.assistant-confirm{border:1px solid #a576ff;background:#35275e;color:#fff;border-radius:8px;padding:8px 12px;margin-top:10px;cursor:pointer}.assistant-composer{padding:16px;border-top:1px solid #223154}.assistant-composer form{display:flex;gap:9px}.assistant-composer textarea{flex:1;resize:vertical;min-height:48px;max-height:160px;background:#091329;border:1px solid #2a3a65;color:#edf4ff;border-radius:10px;padding:12px;font:inherit}.assistant-send{background:linear-gradient(90deg,#386cff,#985dff);border:0;color:white;border-radius:10px;padding:0 18px;font-weight:800;cursor:pointer}.assistant-send:disabled,.assistant-composer textarea:disabled{opacity:.6;cursor:wait}.assistant-hint{color:#7082a8;font-size:10px;margin:9px 2px 0}.assistant-empty{margin:auto;text-align:center;color:#93a3c8;max-width:500px}.assistant-empty h2{color:#edf4ff}.assistant-empty p{line-height:1.6}.assistant-error{color:#ff9bb5}
+@media(max-width:800px){.assistant-layout{grid-template-columns:1fr}.assistant-sidebar{max-height:175px;overflow:auto}.assistant-conversations{grid-template-columns:repeat(2,minmax(0,1fr))}.assistant-panel{min-height:65vh}.assistant-composer form{align-items:stretch}.assistant-send{padding:0 13px}.assistant-message{max-width:100%}}
+</style>
+<div class="page-heading">
+  <div><span class="eyebrow">CONTROLLED AI ACTIONS</span><h1>Opportunity Assistant</h1><p class="subtitle">Search, compare and manage your own opportunities. Sensitive actions require server-verified confirmation.</p></div>
+</div>
+<div class="assistant-layout">
+  <aside class="assistant-sidebar">
+    <div class="assistant-side-head">
+      <h2>Conversations</h2>
+      <form method="post" action="{% url 'ai_chat_new' %}">
+        {% csrf_token %}
+        <button class="assistant-new" type="submit">+ New</button>
+      </form>
+    </div>
+    <nav class="assistant-conversations" aria-label="Conversations">
+      {% for conversation in conversations %}
+      <a class="assistant-conversation{% if current_conversation.pk == conversation.pk %} active{% endif %}" href="{% url 'ai_chat' %}?conversation={{ conversation.pk }}">{{ conversation.title }}</a>
+      {% empty %}
+      <p class="assistant-hint">Your conversations are private to your account.</p>
+      {% endfor %}
+    </nav>
+  </aside>
+  <section class="assistant-panel" aria-label="AI assistant chat">
+    <header class="assistant-head">
+      <h1>{% if current_conversation %}{{ current_conversation.title }}{% else %}New conversation{% endif %}</h1>
+      <p>Actions use a server-side allow-list, your Django permissions, and ownership checks.</p>
+    </header>
+    <div class="assistant-messages" id="assistant-messages" aria-live="polite">
+      {% if current_conversation %}
+        {% for message in current_messages %}
+        <article class="assistant-message {{ message.role }}">
+          <span class="role">{{ message.role }}</span>
+          {{ message.content }}
+          {% if message.tool_result.status %}<span class="status">Action status: {{ message.tool_result.status }}</span>{% endif %}
+          {% if message.tool_result.status == 'confirmation_required' and message.tool_result.data.confirmation_token %}
+          <button class="assistant-confirm" type="button" data-confirm-token="{{ message.tool_result.data.confirmation_token }}">Confirm action</button>
+          {% endif %}
+        </article>
+        {% empty %}
+        <div class="assistant-empty"><h2>What would you like to do?</h2><p>Try “Find remote Python jobs”, “Calculate the match for opportunity 12”, or “Show automation status”.</p></div>
+        {% endfor %}
+      {% else %}
+      <div class="assistant-empty"><h2>Start a private conversation</h2><p>Create a conversation to search opportunities, inspect your applications, and update your own preferences.</p></div>
+      {% endif %}
+    </div>
+    <div class="assistant-composer">
+      {% if current_conversation %}
+      <form id="assistant-form" data-endpoint="{% url 'ai_chat_send' current_conversation.pk %}">
+        {% csrf_token %}
+        <textarea id="assistant-input" name="message" maxlength="4000" placeholder="Ask about opportunities or your applications…" aria-label="Message" required></textarea>
+        <button class="assistant-send" type="submit">Send</button>
+      </form>
+      <p class="assistant-hint">The assistant never invents qualifications or reports queued work as completed submission.</p>
+      {% else %}
+      <p class="assistant-hint">Use “+ New” to start chatting.</p>
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% if current_conversation %}
+<script>
+(() => {
+  const form = document.getElementById('assistant-form');
+  const input = document.getElementById('assistant-input');
+  const messages = document.getElementById('assistant-messages');
+  const sendButton = form.querySelector('button[type="submit"]');
+  const csrf = form.querySelector('[name="csrfmiddlewaretoken"]').value;
+  const endpoint = form.dataset.endpoint;
+
+  function appendMessage(role, text, status = '', confirmationToken = '') {
+    const article = document.createElement('article');
+    article.className = `assistant-message ${role}`;
+    const label = document.createElement('span');
+    label.className = 'role';
+    label.textContent = role;
+    article.appendChild(label);
+    const body = document.createElement('span');
+    body.textContent = text;
+    article.appendChild(body);
+    if (status) {
+      const state = document.createElement('span');
+      state.className = 'status';
+      state.textContent = `Action status: ${status}`;
+      article.appendChild(state);
+    }
+    if (confirmationToken) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'assistant-confirm';
+      button.textContent = 'Confirm action';
+      button.dataset.confirmToken = confirmationToken;
+      article.appendChild(button);
+    }
+    messages.appendChild(article);
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  async function sendMessage(text, confirmationToken = '') {
+    input.disabled = true;
+    sendButton.disabled = true;
+    const pending = document.createElement('article');
+    pending.className = 'assistant-message assistant';
+    pending.textContent = 'Processing…';
+    messages.appendChild(pending);
+    messages.scrollTop = messages.scrollHeight;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
+        body: JSON.stringify({message: text, confirmation_token: confirmationToken})
+      });
+      const payload = await response.json();
+      pending.remove();
+      if (!response.ok || !payload.result) {
+        appendMessage('assistant', payload.message || 'The request could not be processed.', 'error');
+        return;
+      }
+      const result = payload.result;
+      const data = result.data || {};
+      appendMessage(
+        'assistant',
+        result.message || 'No result message was returned.',
+        result.status || '',
+        data.confirmation_token || ''
+      );
+    } catch (error) {
+      pending.remove();
+      appendMessage('assistant', 'The server could not be reached. No success was reported.', 'error');
+    } finally {
+      input.disabled = false;
+      sendButton.disabled = false;
+      input.focus();
+    }
+  }
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    appendMessage('user', text);
+    input.value = '';
+    sendMessage(text);
+  });
+
+  messages.addEventListener('click', event => {
+    const button = event.target.closest('[data-confirm-token]');
+    if (!button) return;
+    button.disabled = true;
+    button.remove();
+    appendMessage('user', 'Confirm');
+    sendMessage('Confirm', button.dataset.confirmToken);
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

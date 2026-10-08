@@ -1,0 +1,122 @@
+{% extends 'base.html' %}
+{% block title %}Admin Command Center | Opportunity Hub{% endblock %}
+{% block breadcrumb %}Admin command center{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">PLATFORM COMMAND CENTER</span>
+    <h1>Automation at a glance</h1>
+    <p class="subtitle">Monitor discovery, AI matching, applications, source health and system activity.</p>
+  </div>
+  <div style="display:flex;gap:8px">
+    {% if can_manage_website_settings %}
+      <a class="button" href="#website-settings">Website settings</a>
+    {% endif %}
+    <a class="button" href="{% url 'analytics_dashboard' %}">Full analytics</a>
+    <a class="button ghost" href="/admin/">Management</a>
+  </div>
+</section>
+
+<section class="stats-grid">
+  <article class="stat-card">
+    <div class="stat-top">Users <span class="stat-icon">👥</span></div>
+    <div class="stat-value">{{ user_count }}</div>
+    <div class="stat-note">{{ active_user_count }} active</div>
+  </article>
+  <article class="stat-card">
+    <div class="stat-top">Sources <span class="stat-icon">◎</span></div>
+    <div class="stat-value">{{ active_source_count }}<span style="font-size:13px;color:#7183aa">/{{ source_count }}</span></div>
+    <div class="stat-note">Healthy and enabled</div>
+  </article>
+  <article class="stat-card">
+    <div class="stat-top">Opportunities <span class="stat-icon">✦</span></div>
+    <div class="stat-value">{{ active_opportunity_count }}</div>
+    <div class="stat-note">{{ opportunity_count }} total</div>
+  </article>
+  <article class="stat-card">
+    <div class="stat-top">Applications <span class="stat-icon">▣</span></div>
+    <div class="stat-value">{{ application_count }}</div>
+    <div class="stat-note">{{ submitted_count }} submitted</div>
+  </article>
+</section>
+
+<div class="analytics-grid">
+  <section class="panel chart">
+    <div class="panel-head">
+      <div><h2>Application funnel</h2><p>Where applications are now</p></div>
+    </div>
+    {% for row in status_data %}
+      <div class="metric-row">
+        <span>{{ row.label }}</span>
+        <div class="metric-track">
+          <svg viewBox="0 0 100 1" preserveAspectRatio="none" aria-hidden="true">
+            <rect class="metric-fill" x="0" y="0" width="{{ row.pct }}" height="1" rx="0.25"></rect>
+          </svg>
+        </div>
+        <b>{{ row.count }}</b>
+      </div>
+    {% endfor %}
+  </section>
+  <section class="panel chart">
+    <div class="panel-head">
+      <div><h2>Automation health</h2><p>Recent background cycles</p></div>
+    </div>
+    {% for run in recent_runs %}
+      <div class="metric-row">
+        <span>{{ run.started_at|date:'M d H:i' }}</span>
+        <div class="metric-track"><div class="metric-fill" style="width:100%"></div></div>
+        <b>{{ run.status|title }}</b>
+      </div>
+    {% empty %}
+      <div class="empty">No runs yet.</div>
+    {% endfor %}
+  </section>
+</div>
+
+<section class="panel" id="website-settings" style="margin-top:15px">
+  <div class="panel-head">
+    <div><h2>Website settings</h2><p>Visibility and registration are independent controls.</p></div>
+  </div>
+  <div class="analytics-grid">
+    <div>
+      <h3>Website visibility</h3>
+      <p>Current: <strong>{{ website_visibility|title }}</strong></p>
+      {% if can_manage_website_settings %}
+        <form method="post" action="{% url 'website_visibility_toggle' %}">
+          {% csrf_token %}
+          <label><input type="radio" name="visibility" value="public" {% if website_visibility == 'public' %}checked{% endif %}> Public / Active</label><br>
+          <label><input type="radio" name="visibility" value="private" {% if website_visibility == 'private' %}checked{% endif %}> Private / Hidden</label><br>
+          <button type="submit" class="button" style="margin-top:12px">Save visibility</button>
+        </form>
+      {% endif %}
+    </div>
+    <div>
+      <h3>Registration mode</h3>
+      <p>Current: <strong>{{ registration_mode_display }}</strong></p>
+      {% if can_manage_website_settings %}
+        <form method="post" action="{% url 'registration_mode_toggle' %}">
+          {% csrf_token %}
+          <label><input type="radio" name="registration_mode" value="open" {% if registration_mode == 'open' %}checked{% endif %}> Open registration</label><br>
+          <label><input type="radio" name="registration_mode" value="admin_approval" {% if registration_mode == 'admin_approval' %}checked{% endif %}> Admin approval required</label><br>
+          <button type="submit" class="button" style="margin-top:12px">Save registration mode</button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+  {% if not can_manage_website_settings %}
+    <p class="muted">Only an administrator with website-settings permission can change these values.</p>
+  {% endif %}
+</section>
+
+<section class="panel" style="margin-top:15px">
+  <div class="panel-head">
+    <div><h2>Quick management actions</h2><p>Jump directly into the control areas</p></div>
+  </div>
+  <div class="admin-shortcuts" style="padding:18px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px">
+    <a class="shortcut" href="/admin/opportunity_agent/source/"><span>🌐</span><strong>Sources</strong><small>Enable, disable and review health</small></a>
+    <a class="shortcut" href="/admin/opportunity_agent/opportunity/"><span>✨</span><strong>Opportunities</strong><small>Review extracted listings</small></a>
+    <a class="shortcut" href="/admin/opportunity_agent/application/"><span>🚀</span><strong>Applications</strong><small>Queue and results</small></a>
+    <a class="shortcut" href="/admin/opportunity_agent/match/"><span>🧠</span><strong>Matches</strong><small>Score and eligibility</small></a>
+  </div>
+</section>
+{% endblock %}

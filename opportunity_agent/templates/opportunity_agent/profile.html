@@ -1,0 +1,17 @@
+{% extends 'base.html' %}{% block title %}My Profile | Opportunity Hub{% endblock %}{% block breadcrumb %}Profile{% endblock %}{% block content %}
+<section class="page-heading"><div><span class="eyebrow">PERSONALIZATION</span><h1>Your profile</h1><p class="subtitle">Your profile drives matching, recommendations and safe application preparation. Enter multiple countries separated by commas, and select any opportunity types and work modes that suit you.</p></div><div class="badge submitted">Profile: {{ profile.profile_completeness }}% complete</div></section>
+<section class="panel" style="padding:18px;margin-bottom:18px">
+    <h2>Profile completeness</h2>
+    <p>Automatic applications are held for review until all required profile sections are complete.</p>
+    <div class="progress-track"><div class="progress-fill" style="width:{{ profile.profile_completeness }}%"></div></div>
+    <div class="form-grid" style="margin-top:14px">
+        {% for section in profile.profile_completeness_sections %}
+        <div class="form-field">
+            <strong>{{ section.name }}</strong>
+            {% if section.complete %}<span class="badge submitted">Complete</span>
+            {% else %}<span class="badge needs_review">Incomplete</span><small>Missing: {{ section.missing_fields|join:', ' }}</small>{% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</section>
+<form method="post" enctype="multipart/form-data" class="detail-card">{% csrf_token %}{{ form.non_field_errors }}<div class="form-grid"><div class="form-field"><label for="account-email">Email</label><input id="account-email" type="email" value="{{ request.user.email }}" readonly><small>This is your account email and sign-in address.</small></div>{% for field in form %}<div class="form-field {% if field.name in 'education work_experience certifications other_links notification_preferences' %}full{% endif %}"><label>{{ field.label }}</label>{{ field }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}{% if field.errors %}{{ field.errors }}{% endif %}</div>{% endfor %}</div><div style="margin-top:20px;display:flex;justify-content:flex-end"><button class="button" type="submit">Save profile</button></div></form>{% endblock %}

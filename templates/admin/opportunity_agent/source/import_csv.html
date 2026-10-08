@@ -1,0 +1,36 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% translate "Home" %}</a>
+  &rsaquo; <a href="{% url 'admin:opportunity_agent_source_changelist' %}">Sources</a>
+  &rsaquo; {{ title }}
+</div>
+{% endblock %}
+{% block content %}
+<div id="content-main">
+  <form method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    <fieldset class="module aligned">
+      {{ form.as_p }}
+    </fieldset>
+    {% if errors %}
+      <div class="errornote">
+        <p>Nothing was imported. Correct these rows and upload the CSV again:</p>
+        <ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul>
+      </div>
+    {% endif %}
+    <div class="submit-row">
+      <input type="submit" value="Validate and import" class="default">
+      <a href="{% url 'admin:opportunity_agent_source_changelist' %}">Cancel</a>
+    </div>
+  </form>
+  <div class="module" style="margin-top: 20px; padding: 16px">
+    <h2>CSV format</h2>
+    <p>Required columns: <code>name,url</code>. Optional columns: <code>source_type,country,opportunity_types,enabled,trust_score,scan_frequency,notes</code>.</p>
+    <p>Separate multiple opportunity types with <code>|</code>. URLs already registered, repeated URLs in the file, and repeated rows are skipped. If any row is invalid, the import is rejected without saving any rows.</p>
+    <p>Supported source types: website, job_site, scholarship_site, university, ngo, government, international_org, company, fellowship_portal, grant_portal, rss, telegram, api, discovered, other.</p>
+    <p>Supported scan frequencies: manual, hourly, every_6_hours, daily, weekly.</p>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,44 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  web:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: sh -c "python -m pip install -r requirements.txt && python manage.py migrate && python manage.py setup_roles && python manage.py runserver 0.0.0.0:8000"
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+  worker:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: sh -c "python -m pip install -r requirements.txt && celery -A global_opportunity_agent.celery worker --loglevel=INFO --pool=solo"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+  beat:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: sh -c "python -m pip install -r requirements.txt && celery -A global_opportunity_agent.celery beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis

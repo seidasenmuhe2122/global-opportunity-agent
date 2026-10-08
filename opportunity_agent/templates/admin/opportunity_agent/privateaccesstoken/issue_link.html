@@ -1,0 +1,53 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% translate "Home" %}</a>
+  &rsaquo; <a href="{{ changelist_url }}">Private access tokens</a>
+  &rsaquo; Issue private access link
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+  {% if issued_link %}
+    <div class="messagelist">
+      <div class="success">
+        The link for "{{ issued_link.label }}" is shown once. Copy and share it securely.
+      </div>
+    </div>
+    <label for="private-access-url">Private access URL</label>
+    <div>
+      <input id="private-access-url" type="url" value="{{ issued_link.url }}" readonly>
+      <button type="button" onclick="copyPrivateAccessUrl()">Copy link</button>
+    </div>
+    <p id="copy-status" aria-live="polite"></p>
+    <script>
+      function copyPrivateAccessUrl() {
+        const input = document.getElementById('private-access-url');
+        const status = document.getElementById('copy-status');
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(input.value).then(
+            () => { status.textContent = 'Link copied.'; },
+            () => { status.textContent = 'Copy failed. Select and copy the URL manually.'; }
+          );
+          return;
+        }
+        input.select();
+        status.textContent = document.execCommand('copy')
+          ? 'Link copied.'
+          : 'Copy failed. Select and copy the URL manually.';
+      }
+    </script>
+  {% else %}
+    <form method="post">
+      {% csrf_token %}
+      {{ form.as_p }}
+      <div class="submit-row">
+        <input type="submit" value="Create private access link" class="default">
+      </div>
+    </form>
+  {% endif %}
+</div>
+{% endblock %}

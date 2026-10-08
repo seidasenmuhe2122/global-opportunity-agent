@@ -1,0 +1,95 @@
+{% extends 'base.html' %}
+{% block title %}My Dashboard | Opportunity Hub{% endblock %}
+{% block breadcrumb %}My dashboard{% endblock %}
+{% block content %}
+<section class="page-heading">
+    <div><span class="eyebrow">PERSONAL OPPORTUNITY WORKSPACE</span><h1>Welcome, {{ profile.full_name|default:request.user.username }} 👋</h1><p class="subtitle">Your profile, matches and application automation in one place.</p></div>
+    <a class="button" href="/opportunities/">Explore opportunities →</a>
+</section>
+<section class="welcome">
+    <div><span class="eyebrow">PROFILE STRENGTH</span><h2>Profile: {{ profile.profile_completeness }}% complete</h2><p>Complete your profile and CV to improve matching quality.</p><p><strong>Auto Apply:</strong> {% if profile.auto_apply %}On{% else %}Off{% endif %}</p>
+        {% if profile.missing_profile_fields %}<p><strong>Missing:</strong> {{ profile.missing_profile_fields|join:', ' }}</p><a class="text-link" href="{% url 'profile_edit' %}">Complete your profile →</a>{% else %}<p>All key profile sections are complete.</p>{% endif %}
+    </div>
+    <div class="progress-block"><div class="progress-line"><span>Profile completeness</span><b>{{ profile.profile_completeness }}%</b></div><div class="progress-track"><div class="progress-fill" style="width:{{ profile.profile_completeness }}%"></div></div></div>
+</section>
+<section class="stats-grid">
+    <article class="stat-card"><div class="stat-top">Applications <span class="stat-icon">▣</span></div><div class="stat-value">{{ application_count }}</div><div class="stat-note">All application records</div></article>
+    <article class="stat-card"><div class="stat-top">Applied <span class="stat-icon">✓</span></div><div class="stat-value">{{ submitted_count }}</div><div class="stat-note">Successfully submitted</div></article>
+    <article class="stat-card"><div class="stat-top">Rejected <span class="stat-icon">↩</span></div><div class="stat-value">{{ rejected_count }}</div><div class="stat-note">Application decisions</div></article>
+    <article class="stat-card"><div class="stat-top">Failed <span class="stat-icon">!</span></div><div class="stat-value">{{ failed_count }}</div><div class="stat-note">Requires attention</div></article>
+    <article class="stat-card"><div class="stat-top">Needs review <span class="stat-icon">◉</span></div><div class="stat-value">{{ needs_review_count }}</div><div class="stat-note">Manual action required</div></article>
+    <article class="stat-card"><div class="stat-top">Daily application count <span class="stat-icon">◷</span></div><div class="stat-value">{{ daily_count }}<span style="font-size:14px;color:#7183aa">/{{ daily_limit }}</span></div><div class="stat-note">Distinct applications attempted today</div></article>
+</section>
+<div class="content-grid grid">
+    <section class="panel">
+        <div class="panel-head"><div><h2>Recommended opportunities</h2><p>Highest scoring matches · minimum score {{ minimum_match_score }}%</p></div><a class="text-link" href="/opportunities/">Explore →</a></div>
+        <div class="list">
+            {% for match in matches %}
+            <article class="list-item">
+                <span class="list-mark">{% if match.score >= 90 %}🔥{% elif match.score >= 80 %}✦{% else %}◎{% endif %}</span>
+                <span class="list-copy">
+                    <strong><a href="/opportunities/{{ match.opportunity.pk }}/">{{ match.opportunity.title }}</a></strong>
+                    <p>{{ match.opportunity.organization|default:'Organization not specified' }} · {{ match.opportunity.country|default:'Worldwide' }}</p>
+                    {% if match.strong_matches %}<p><strong>Strong matches:</strong> {% for item in match.strong_matches %}{{ item }}{% if not forloop.last %} {% endif %}{% endfor %}</p>{% endif %}
+                    {% if match.reasons %}<p><strong>Why it matches:</strong> {% for item in match.reasons %}{{ item }}{% if not forloop.last %} {% endif %}{% endfor %}</p>{% endif %}
+                    {% if match.missing_requirements %}<p><strong>Missing/unconfirmed:</strong> {% for item in match.missing_requirements %}{{ item }}{% if not forloop.last %} {% endif %}{% endfor %}</p>{% endif %}
+                    {% if match.risk_factors %}<p><strong>Risks:</strong> {% for item in match.risk_factors %}{{ item }}{% if not forloop.last %} {% endif %}{% endfor %}</p>{% endif %}
+                    {% if match.recommended_action %}<p><strong>Recommended:</strong> {{ match.recommended_action|title }}</p>{% endif %}
+                </span>
+                <span class="badge submitted">{{ match.score }}%</span>
+            </article>
+            {% empty %}<div class="empty">No eligible matches yet. Complete your profile and run the automation engine.</div>{% endfor %}
+        </div>
+    </section>
+    <aside class="panel">
+        <div class="panel-head"><div><h2>Upcoming deadlines</h2><p>Active opportunities closing within 30 days</p></div></div>
+        <div class="list">
+            {% for opportunity in upcoming_deadlines %}
+            <div class="list-item"><span class="list-mark">⏳</span><span class="list-copy"><strong><a href="/opportunities/{{ opportunity.pk }}/">{{ opportunity.title }}</a></strong><p>{{ opportunity.organization|default:'Organization not specified' }}</p></span><span class="badge">{{ opportunity.deadline|date:'M d' }}</span></div>
+            {% empty %}<div class="empty">No upcoming deadlines in the next 30 days.</div>{% endfor %}
+        </div>
+    </aside>
+</div>
+<section class="panel" style="margin-top:20px">
+    <div class="panel-head"><div><h2>Recent applications</h2><p>Your application activity and latest status changes</p></div></div>
+    <div class="list">
+        {% for app in applications %}
+        <div class="list-item"><span class="list-mark">📨</span><span class="list-copy"><strong><a href="/opportunities/{{ app.opportunity.pk }}/">{{ app.opportunity.title }}</a></strong><p>{{ app.created_at|date:'M d, Y' }} · {{ app.status|title }}</p>{% if app.rejection_reason %}<p>{{ app.rejection_reason }}</p>{% elif app.error_message %}<p>{{ app.error_message }}</p>{% endif %}</span><span class="badge {{ app.status }}">{{ app.match_score }}%</span></div>
+        {% empty %}<div class="empty">No applications yet.</div>{% endfor %}
+    </div>
+</section>
+<div class="content-grid grid" style="margin-top:20px">
+    <section class="panel">
+        <div class="panel-head"><div><h2>Applied opportunities</h2><p>Confirmed submissions</p></div></div>
+        <div class="list">
+            {% for app in applied_opportunities %}
+            <div class="list-item"><span class="list-mark">✓</span><span class="list-copy"><strong>{{ app.opportunity.title }}</strong><p>{{ app.submission_time|date:'M d, Y H:i'|default:app.updated_at|date:'M d, Y' }}</p></span><span class="badge submitted">{{ app.match_score }}%</span></div>
+            {% empty %}<div class="empty">No submitted applications yet.</div>{% endfor %}
+        </div>
+    </section>
+    <section class="panel">
+        <div class="panel-head"><div><h2>Rejected applications</h2><p>Review the recorded decision</p></div></div>
+        <div class="list">
+            {% for app in rejected_applications %}
+            <div class="list-item"><span class="list-mark">↩</span><span class="list-copy"><strong>{{ app.opportunity.title }}</strong><p>{{ app.rejection_reason|default:app.error_message|default:'No reason recorded.' }}</p></span><span class="badge">{{ app.match_score }}%</span></div>
+            {% empty %}<div class="empty">No rejected applications.</div>{% endfor %}
+        </div>
+    </section>
+    <section class="panel">
+        <div class="panel-head"><div><h2>Failed applications</h2><p>Latest error and attempt details</p></div></div>
+        <div class="list">
+            {% for app in failed_applications %}
+            <div class="list-item"><span class="list-mark">!</span><span class="list-copy"><strong>{{ app.opportunity.title }}</strong><p>{{ app.error_message|default:'No error details recorded.' }} · {{ app.attempts }} attempt(s)</p></span></div>
+            {% empty %}<div class="empty">No failed applications.</div>{% endfor %}
+        </div>
+    </section>
+    <section class="panel">
+        <div class="panel-head"><div><h2>Needs review</h2><p>Manual review required before proceeding</p></div></div>
+        <div class="list">
+            {% for app in review_applications %}
+            <div class="list-item"><span class="list-mark">◉</span><span class="list-copy"><strong>{{ app.opportunity.title }}</strong><p>{{ app.error_message|default:app.rejection_reason|default:'Review this application and choose the next action.' }}</p></span><span class="badge needs_review">{{ app.match_score }}%</span></div>
+            {% empty %}<div class="empty">No applications currently need review.</div>{% endfor %}
+        </div>
+    </section>
+</div>
+{% endblock %}

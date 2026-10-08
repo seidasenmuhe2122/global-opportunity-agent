@@ -1,0 +1,74 @@
+{% extends "admin/base.html" %}
+{% load static %}
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'css/admin_command.css' %}">{% endblock %}
+{% block branding %}<h1 id="site-name"><a href="{% url 'admin:index' %}">◈ Opportunity Hub <span style="font-size:12px;opacity:.7">COMMAND CENTER</span></a></h1>{% endblock %}
+{% block nav-global %}
+<div style="padding:10px 20px;background:#070d22;border-top:1px solid #172452;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <a href="/admin-dashboard/" style="color:#7edfff">📊 Analytics</a>
+  <a href="/opportunities/" style="color:#a9c8ff">🌍 Opportunities</a>
+  <a href="/dashboard/" style="color:#bca5ff">👤 User Dashboard</a>
+  <a href="/assistant/" style="color:#d0b3ff">🤖 AI Assistant</a>
+  <button type="button" data-theme-toggle aria-label="Toggle light and dark mode" style="margin-left:auto;display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:999px;border:1px solid #2d4470;background:rgba(255,255,255,.04);color:#dfe8ff;cursor:pointer">☀</button>
+</div>
+<script>
+(function(){
+  const STORAGE_KEY='oa-admin-theme';
+  const root=document.documentElement;
+  const apply=(theme)=>{
+    const safe=theme==='light'?'light':'dark';
+    root.setAttribute('data-theme', safe);
+    document.querySelectorAll('[data-theme-toggle]').forEach((button)=>{
+      button.textContent = safe === 'dark' ? '☀' : '☾';
+      button.setAttribute('aria-label', safe === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+    });
+  };
+  const saved=localStorage.getItem(STORAGE_KEY);
+  const preferred=saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  apply(preferred);
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('[data-theme-toggle]').forEach(function(button){
+      button.addEventListener('click', function(){
+        const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        localStorage.setItem(STORAGE_KEY, next);
+        apply(next);
+      });
+    });
+  });
+})();
+</script>
+<style>
+  :root[data-theme="light"] body,
+  :root[data-theme="light"] #container,
+  :root[data-theme="light"] .dashboard,
+  :root[data-theme="light"] .module,
+  :root[data-theme="light"] .app-list,
+  :root[data-theme="light"] .submit-row,
+  :root[data-theme="light"] .change-list,
+  :root[data-theme="light"] .object-tools,
+  :root[data-theme="light"] .calendar,
+  :root[data-theme="light"] .calendar td,
+  :root[data-theme="light"] .calendar th,
+  :root[data-theme="light"] .paginator,
+  :root[data-theme="light"] .delete-confirmation {
+    background: #f5f8ff !important;
+    color: #1a273d !important;
+  }
+  :root[data-theme="light"] #header,
+  :root[data-theme="light"] .module caption,
+  :root[data-theme="light"] .module h2,
+  :root[data-theme="light"] .module h3,
+  :root[data-theme="light"] .module .sublist,
+  :root[data-theme="light"] .results,
+  :root[data-theme="light"] .paginator,
+  :root[data-theme="light"] .object-tools {
+    background: #ffffff !important;
+    color: #1b2740 !important;
+    border-color: #dce6f8 !important;
+  }
+  :root[data-theme="light"] a,
+  :root[data-theme="light"] .module a,
+  :root[data-theme="light"] #nav-sidebar a {
+    color: #1c3f7a !important;
+  }
+</style>
+{% endblock %}

@@ -1,0 +1,8 @@
+{% extends "admin/change_list.html" %}
+{% load i18n %}
+{% block object-tools-items %}
+  <li>
+    <a href="{% url 'admin:opportunity_agent_source_import_csv' %}">Import sources from CSV</a>
+  </li>
+  {{ block.super }}
+{% endblock %}
