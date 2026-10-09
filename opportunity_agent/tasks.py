@@ -1,45 +1,110 @@
 from __future__ import annotations
-import ipaddress, socket, asyncio
+import asyncio
 import logging
 from datetime import timedelta
-from urllib.parse import urlsplit
+import os
+import re
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from celery import shared_task
 from bs4 import BeautifulSoup
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from .models import Application, ApplicationAttempt, ApplicationFormTemplate, SiteCredential, AuditLog, AutomationRun, Match, Opportunity, Source, TelegramSource, UserProfile, ProviderAdapter
+from .models import Application, ApplicationAttempt, ApplicationFormTemplate, SiteCredential, AuditLog, AutomationRun, Match, Opportunity, Source, TelegramMessageRetry, TelegramSource, UserProfile, ProviderAdapter
 from .services.ai_engine import AIClient, AIProviderError
 from .services.application_guard import ApplicationGuard
 from .services.deduplication import deduplicate_and_save_opportunity
-from .services.matching import compute_match_score
+from .services.matching import (
+    compute_match_score,
+    opportunity_match_data,
+    profile_match_data,
+    save_match,
+)
 from .services.source_discovery import discover_public_sources
 from .services.source_ingestion import (
     basic_extract,
+    detail_page_content,
     extract_candidates,
     fetch_public_source,
     is_listing_page,
+    is_listing_opportunity,
+    opportunity_detail_validation_error,
 )
 from .services.provider_adapters import adapter_for
+from .services.public_http import public_addresses
 from .services.document_forms import download_form, fill_pdf
 from .services.telegram import TelegramNotifier
 import requests
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 MAX_TASK_BATCH_SIZE=100; SOURCE_REQUEST_TIMEOUT=15
 
 def _validate_public_source_url(url):
-    p=urlsplit(url)
-    if p.scheme not in {'http','https'} or not p.hostname or p.username or p.password: raise ValueError('Source URL must be a public HTTP or HTTPS URL.')
-    if p.hostname.lower().endswith(('.localhost','.local')): raise ValueError('Local network source URLs are not allowed.')
-    try: addresses=socket.getaddrinfo(p.hostname,p.port or (443 if p.scheme=='https' else 80))
-    except OSError as e: raise ValueError(f'Source hostname could not be resolved: {e}') from e
-    ips={ipaddress.ip_address(x[4][0]) for x in addresses}
-    if not ips or any(not ip.is_global for ip in ips): raise ValueError('Source URL must resolve only to public IP addresses.')
+    try:
+        public_addresses(url)
+    except ValueError as exc:
+        raise ValueError(f'Source URL is not safe to fetch: {exc}') from exc
 
 def _validate_limit(limit):
     if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=MAX_TASK_BATCH_SIZE: raise ValueError(f'limit must be an integer between 1 and {MAX_TASK_BATCH_SIZE}')
     return limit
+
+
+def _safe_error_text(error):
+    message = str(error or 'Operation failed.')
+    for name, value in os.environ.items():
+        upper_name = name.upper()
+        if value and any(
+            marker in upper_name
+            for marker in ('PASSWORD', 'SECRET', 'TOKEN', 'API_KEY', 'AUTH', 'BOT')
+        ) and len(value) >= 6:
+            message = message.replace(value, '[redacted]')
+    message = re.sub(
+        r'(?i)([?&](?:token|access_token|refresh_token|auth|code|state|session|key|ticket|password|secret|signature)=)[^&\s]+',
+        r'\1[redacted]',
+        message,
+    )
+    message = re.sub(
+        r'(?i)\b(password|passwd|secret|token|api[_-]?key)\s*([:=]\s*)[^\s,;]+',
+        r'\1\2[redacted]',
+        message,
+    )
+    return message[:2000]
+
+
+def _safe_source_url(url):
+    try:
+        parsed = urlsplit(url or '')
+        sensitive = re.compile(
+            r'(token|secret|key|password|auth|signature|credential|session)',
+            re.I,
+        )
+        query = [
+            (key, '[redacted]' if sensitive.search(key) else value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+        path_parts = parsed.path.split('/')
+        for index, part in enumerate(path_parts[:-1]):
+            if part.casefold() in {
+                'verify', 'verification', 'token', 'reset', 'password-reset',
+                'activate', 'activation',
+            }:
+                path_parts[index + 1] = 'redacted'
+        netloc = parsed.netloc
+        if parsed.username or parsed.password:
+            host = parsed.hostname or ''
+            if parsed.port:
+                host = f'{host}:{parsed.port}'
+            netloc = f'[redacted]@{host}'
+        return urlunsplit(parsed._replace(
+            netloc=netloc,
+            path='/'.join(path_parts),
+            query=urlencode(query),
+            fragment='',
+        ))
+    except ValueError:
+        return '[invalid-url]'
 
 
 def _sources_due_for_scan(now=None):
@@ -79,40 +144,14 @@ def _telegram_sources_due_for_scan(now=None):
         status__in=['active', 'pending', 'error', 'scanning'],
     ).filter(due).order_by('last_scan', 'pk')
 
-def _profile_dict(p):
-    return {'skills':p.skills,'current_country':p.current_country,'target_countries':p.target_countries,'worldwide_preference':p.worldwide_preference,'preferred_opportunity_types':p.preferred_opportunity_types,'preferred_work_modes':p.preferred_work_modes,'visa_sponsorship_preference':p.visa_sponsorship_preference,'salary_stipend_preference':p.salary_stipend_preference,'minimum_ai_match_score':p.minimum_ai_match_score,'auto_apply':p.auto_apply,'education':p.education,'degree':p.degree,'certifications':p.certifications,'work_experience':p.work_experience,'languages':p.languages}
+def _profile_dict(profile):
+    return profile_match_data(profile)
 
-def _opp_dict(o):
-    return {'skills':o.skills,'country':o.country,'work_mode':o.work_mode,'remote_worldwide':o.remote_worldwide,'opportunity_type':o.opportunity_type,'visa_sponsorship':o.visa_sponsorship,'education_requirements':o.education_requirements,'experience_requirements':o.experience_requirements,'languages':o.languages,'salary_stipend':o.salary_stipend,'qualifications':o.qualifications,'requirements':o.requirements}
+def _opp_dict(opportunity):
+    return opportunity_match_data(opportunity)
 
-def _save_match(user,opportunity,result):
-    match, created = Match.objects.update_or_create(
-        user=user,
-        opportunity=opportunity,
-        defaults={
-            'score': result['score'],
-            'eligible': result['eligible'],
-            'reasons': result['reasons'],
-            'strong_matches': result.get('strong_matches', []),
-            'missing_requirements': result['missing'],
-            'risk_factors': result.get('risks', []),
-            'recommended_action': result.get('recommended_action', ''),
-        },
-    )
-    if created:
-        from .services.audit import record_audit_event
-
-        record_audit_event(
-            'opportunity_matched',
-            match.pk,
-            {
-                'user_id': user.pk,
-                'opportunity_id': opportunity.pk,
-                'score': result['score'],
-                'eligible': result['eligible'],
-            },
-        )
-    return match, created
+def _save_match(user, opportunity, result):
+    return save_match(user, opportunity, result)
 
 def _upsert_opportunity(source,data):
     return deduplicate_and_save_opportunity(
@@ -121,9 +160,156 @@ def _upsert_opportunity(source,data):
         raw_content=data.get('raw_source_content') or data.get('description') or '',
     )
 
+
+def _process_telegram_candidate(source, candidate, ai):
+    data = basic_extract(candidate, source)
+    evidence_text = '\n'.join(filter(None, (
+        candidate.get('text', ''),
+        'URL:' + candidate.get('url', '') if candidate.get('url') else '',
+    )))
+    try:
+        ai_data = ai.extract_opportunity(
+            evidence_text,
+            candidate.get('url', ''),
+            source.name,
+        )
+    except AIProviderError:
+        logger.warning(
+            'AI extraction unavailable for Telegram source %s candidate %s; '
+            'using explicit source fields only.',
+            source.pk,
+            _safe_source_url(candidate.get('url', '')),
+        )
+        ai_data = {}
+    if ai_data:
+        data.update({
+            key: value
+            for key, value in ai_data.items()
+            if value not in ('', None, [], {})
+            and key not in {
+                'source_url', 'raw_source_content', 'application_url',
+                'application_form_url', 'application_form_type',
+                'application_method', 'application_methods',
+                'application_instructions',
+            }
+            and (
+                key not in {
+                    'contact_email', 'contact_phone', 'telegram_contact',
+                    'physical_address', 'organization_website',
+                }
+                or not data.get(key)
+            )
+            and (key != 'description' or not data.get('description'))
+        })
+    data['raw_source_content'] = (
+        candidate.get('raw_source_content')
+        or candidate.get('text')
+        or ''
+    )
+    opportunity, created = _upsert_opportunity(source, data)
+    if opportunity:
+        for profile in UserProfile.objects.select_related('user').filter(
+            user__is_active=True,
+        ):
+            result = compute_match_score(
+                _profile_dict(profile),
+                _opp_dict(opportunity),
+            )
+            _save_match(profile.user, opportunity, result)
+            if result['eligible'] and profile.auto_apply:
+                Application.objects.get_or_create(
+                    user=profile.user,
+                    opportunity=opportunity,
+                    defaults={
+                        'match_score': result['score'],
+                        'status': 'queued',
+                    },
+                )
+    return opportunity, created
+
+
+def _telegram_retry_delay(retry_count):
+    delay = settings.TELEGRAM_POST_RETRY_BASE_SECONDS * (2 ** max(0, retry_count - 1))
+    return min(delay, settings.TELEGRAM_POST_RETRY_MAX_SECONDS)
+
+
+def _retry_candidate(record):
+    channel = record.channel_identifier
+    return {
+        'title': record.message_text.splitlines()[0][:255] if record.message_text else '',
+        'url': f'https://t.me/{channel}/{record.message_id}',
+        'source_landing_url': f'https://t.me/{channel}',
+        'text': record.message_text,
+        'html': '',
+        'message_id': record.message_id,
+        'raw_source_content': record.message_text,
+    }
+
+
+def _process_due_telegram_retries(source, ai, now=None):
+    now = now or timezone.now()
+    resolved = 0
+    dead_lettered = 0
+    errors = []
+    records = TelegramMessageRetry.objects.filter(
+        source=source,
+        status='pending',
+        next_retry_at__lte=now,
+    ).order_by('next_retry_at', 'message_id')[
+        :settings.SOURCE_CANDIDATE_BATCH_SIZE
+    ]
+    for record in records:
+        try:
+            _process_telegram_candidate(source, _retry_candidate(record), ai)
+        except Exception as exc:
+            safe_error = _safe_error_text(exc)
+            record.retry_count += 1
+            record.last_error = safe_error
+            if record.retry_count >= settings.TELEGRAM_POST_RETRY_MAX_ATTEMPTS:
+                record.status = 'dead_letter'
+                record.next_retry_at = None
+                record.save(update_fields=[
+                    'retry_count', 'last_error', 'status', 'next_retry_at',
+                    'updated_at',
+                ])
+                dead_lettered += 1
+            else:
+                record.next_retry_at = now + timedelta(
+                    seconds=_telegram_retry_delay(record.retry_count),
+                )
+                record.save(update_fields=[
+                    'retry_count', 'last_error', 'next_retry_at', 'updated_at',
+                ])
+            errors.append({
+                'telegram_source_id': source.pk,
+                'message_id': record.message_id,
+                'error': safe_error,
+                'retry_status': record.status,
+            })
+            logger.error(
+                'Telegram retry failed for source %s message %s (%s): %s',
+                source.pk,
+                record.message_id,
+                record.status,
+                safe_error,
+            )
+        else:
+            record.status = 'resolved'
+            record.last_error = ''
+            record.next_retry_at = None
+            record.resolved_at = now
+            record.save(update_fields=[
+                'status', 'last_error', 'next_retry_at', 'resolved_at',
+                'updated_at',
+            ])
+            resolved += 1
+    return {'resolved': resolved, 'dead_lettered': dead_lettered, 'errors': errors}
+
+
 @shared_task
 def scan_sources_task(limit=10, source_ids=None):
     limit=_validate_limit(limit); successful=0; errors=[]; candidate_errors=[]; new_opportunities=0
+    updated_opportunities=0; pages_processed=0
     if source_ids is None:
         sources=list(_sources_due_for_scan()[:limit])
     else:
@@ -156,8 +342,16 @@ def scan_sources_task(limit=10, source_ids=None):
         try:
             _validate_public_source_url(source.url)
             final_url,body,_=fetch_public_source(source.url,SOURCE_REQUEST_TIMEOUT)
-            candidates=list(extract_candidates(source,final_url,body))[:50]
-            for candidate in candidates:
+            candidate_count = 0
+            next_cursor = source.candidate_scan_cursor
+            reached_end = True
+            for candidate_index, candidate in enumerate(extract_candidates(source,final_url,body)):
+                if candidate_index < source.candidate_scan_cursor:
+                    continue
+                if candidate_count >= settings.SOURCE_CANDIDATE_BATCH_SIZE:
+                    next_cursor = candidate_index
+                    reached_end = False
+                    break
                 try:
                     if candidate.get('fetch_detail_page'):
                         candidate_url = candidate.get('url', '')
@@ -167,21 +361,60 @@ def scan_sources_task(limit=10, source_ids=None):
                             SOURCE_REQUEST_TIMEOUT,
                         )
                         detail_soup = BeautifulSoup(detail_body, 'html.parser')
+                        content_node = detail_page_content(detail_url, detail_body)
                         detail_title = detail_soup.find('h1') or detail_soup.title
                         if detail_title:
                             candidate['title'] = detail_title.get_text(' ', strip=True)
-                        candidate['url'] = detail_url
-                        candidate['text'] = detail_soup.get_text('\n', strip=True)
+                        canonical = detail_soup.find(
+                            'link',
+                            rel=lambda value: value and any(
+                                str(item).casefold() == 'canonical'
+                                for item in (value if isinstance(value, list) else [value])
+                            ),
+                        )
+                        if canonical and canonical.get('href'):
+                            canonical_url = urljoin(detail_url, canonical['href'])
+                            canonical_parts = urlsplit(canonical_url)
+                            detail_parts = urlsplit(detail_url)
+                            canonical_host = (canonical_parts.hostname or '').lower().removeprefix('www.')
+                            detail_host = (detail_parts.hostname or '').lower().removeprefix('www.')
+                            if (
+                                canonical_host == detail_host
+                                and canonical_parts.scheme in {'http', 'https'}
+                                and not canonical_parts.username
+                                and not canonical_parts.password
+                            ):
+                                _validate_public_source_url(canonical_url)
+                                candidate['url'] = canonical_url
+                            else:
+                                candidate['url'] = detail_url
+                        else:
+                            candidate['url'] = detail_url
+                        candidate['text'] = content_node.get_text('\n', strip=True)
                         candidate['html'] = detail_body
                         candidate['raw_source_content'] = detail_body
 
-                    if source.source_type == 'website' and is_listing_page(candidate):
+                    if is_listing_page(candidate):
                         logger.info(
                             'Skipping listing/category page for source %s: %s',
                             source.pk,
-                            candidate.get('url', ''),
+                            _safe_source_url(candidate.get('url', '')),
                         )
+                        candidate_count += 1
+                        next_cursor = candidate_index + 1
                         continue
+                    if candidate.get('fetch_detail_page'):
+                        detail_error = opportunity_detail_validation_error(candidate)
+                        if detail_error:
+                            logger.info(
+                                'Skipping unverified opportunity detail for source %s: %s (%s)',
+                                source.pk,
+                                _safe_source_url(candidate.get('url', '')),
+                                detail_error,
+                            )
+                            candidate_count += 1
+                            next_cursor = candidate_index + 1
+                            continue
 
                     data=basic_extract(candidate,source)
                     evidence_text = '\n'.join(filter(None, (
@@ -191,15 +424,16 @@ def scan_sources_task(limit=10, source_ids=None):
                     try:
                         ai_data=ai.extract_opportunity(
                             evidence_text,
-                            candidate.get('source_landing_url') or candidate.get('url',''),
+                            candidate.get('url') or candidate.get('source_landing_url', ''),
                             source.name,
                         )
-                    except AIProviderError:
+                    except AIProviderError as exc:
                         logger.warning(
-                            'AI extraction unavailable for source %s candidate %s; using explicit source fields only.',
+                            'AI extraction unavailable for source %s candidate %s '
+                            '(%s); using explicit source fields only.',
                             source.pk,
-                            candidate.get('url', ''),
-                            exc_info=True,
+                            _safe_source_url(candidate.get('url', '')),
+                            _safe_error_text(exc),
                         )
                         ai_data = {}
                     if ai_data:
@@ -207,7 +441,19 @@ def scan_sources_task(limit=10, source_ids=None):
                             key: value
                             for key, value in ai_data.items()
                             if value not in ('', None, [], {})
-                            and key not in {'source_url', 'raw_source_content', 'application_url'}
+                            and key not in {
+                                'source_url', 'raw_source_content', 'application_url',
+                                'application_form_url', 'application_form_type',
+                                'application_method', 'application_methods',
+                                'application_instructions',
+                            }
+                            and (
+                                key not in {
+                                    'contact_email', 'contact_phone', 'telegram_contact',
+                                    'physical_address', 'organization_website',
+                                }
+                                or not data.get(key)
+                            )
                             and (key != 'description' or not data.get('description'))
                         })
                     data['raw_source_content'] = (
@@ -219,33 +465,50 @@ def scan_sources_task(limit=10, source_ids=None):
                     opp,created=_upsert_opportunity(source,data)
                     if opp:
                         new_opportunities += int(created)
+                        updated_opportunities += int(not created)
                         for profile in UserProfile.objects.select_related('user').filter(user__is_active=True):
                             result=compute_match_score(_profile_dict(profile),_opp_dict(opp)); _save_match(profile.user,opp,result)
                             if result['eligible'] and profile.auto_apply:
                                 Application.objects.get_or_create(user=profile.user,opportunity=opp,defaults={'match_score':result['score'],'status':'queued'})
                 except Exception as exc:
+                    safe_error = _safe_error_text(exc)
+                    safe_candidate_url = _safe_source_url(candidate.get('url', ''))
                     candidate_errors.append({
                         'source_id': source.pk,
-                        'url': candidate.get('url', ''),
-                        'error': str(exc),
+                        'url': safe_candidate_url,
+                        'error': safe_error,
                     })
-                    logger.exception(
-                        'Opportunity candidate processing failed for source %s (%s); continuing.',
+                    logger.error(
+                        'Opportunity candidate processing failed for source %s (%s); continuing: %s',
                         source.pk,
-                        candidate.get('url', ''),
+                        safe_candidate_url,
+                        safe_error,
                     )
+                candidate_count += 1
+                next_cursor = candidate_index + 1
+            if reached_end:
+                next_cursor = 0
+            pages_processed += candidate_count
+            source.candidate_scan_cursor = next_cursor
             source.status='active'; source.error_count=0; source.last_scan=now; source.last_successful_scan=now
-            source.save(update_fields=['status','error_count','last_scan','last_successful_scan','updated_at']); successful += 1
+            source.save(update_fields=['candidate_scan_cursor','status','error_count','last_scan','last_successful_scan','updated_at']); successful += 1
         except Exception as exc:
-            source.status='error'; source.error_count+=1; source.save(update_fields=['status','error_count','updated_at']); errors.append({'source_id':source.pk,'error':str(exc)})
-            logger.exception('Opportunity source scan failed for source %s (%s).', source.pk, source.url)
+            safe_error = _safe_error_text(exc)
+            safe_source_url = _safe_source_url(source.url)
+            source.status='error'; source.error_count+=1; source.save(update_fields=['status','error_count','updated_at']); errors.append({'source_id':source.pk,'error':safe_error})
+            logger.error(
+                'Opportunity source scan failed for source %s (%s): %s',
+                source.pk,
+                safe_source_url,
+                safe_error,
+            )
             from .services.audit import record_audit_event
 
             try:
                 record_audit_event(
                     'source_scan_failed',
                     source.pk,
-                    {'source_type': source.source_type, 'error_count': source.error_count, 'error': str(exc)[:1000]},
+                    {'source_type': source.source_type, 'error_count': source.error_count, 'error': safe_error[:1000]},
                 )
             except Exception:
                 logger.exception('Could not audit failed scan for source %s.', source.pk)
@@ -254,6 +517,8 @@ def scan_sources_task(limit=10, source_ids=None):
         'successful': successful,
         'source_ids': source_ids,
         'new_opportunities': new_opportunities,
+        'updated_opportunities': updated_opportunities,
+        'pages_processed': pages_processed,
         'errors': errors,
         'candidate_errors': candidate_errors,
     }
@@ -297,6 +562,8 @@ def scan_telegram_sources_task(limit=10, telegram_source_ids=None):
     successful = 0
     new_opportunities = 0
     errors = []
+    candidate_errors = []
+    retry_results = []
     ai = AIClient()
     for source in sources:
         now = timezone.now()
@@ -306,60 +573,112 @@ def scan_telegram_sources_task(limit=10, telegram_source_ids=None):
         try:
             from .services.telegram_collector import collect_public_channel
 
-            candidates = asyncio.run(collect_public_channel(source, limit=50))
+            retry_results.append({
+                'telegram_source_id': source.pk,
+                **_process_due_telegram_retries(source, ai, now),
+            })
+            candidates = asyncio.run(collect_public_channel(
+                source,
+                limit=settings.SOURCE_CANDIDATE_BATCH_SIZE,
+                min_message_id=source.last_message_id,
+            ))
+            stop_before_unpersisted_failure = False
             for candidate in candidates:
-                data = basic_extract(candidate, source)
+                message_id = candidate.get('message_id')
                 try:
-                    evidence_text = '\n'.join(filter(None, (
-                        candidate.get('text', ''),
-                        'URL:' + candidate.get('url', '') if candidate.get('url') else '',
-                    )))
-                    ai_data = ai.extract_opportunity(
-                        evidence_text,
-                        candidate.get('url', ''),
-                        source.name,
+                    opportunity, created = _process_telegram_candidate(
+                        source,
+                        candidate,
+                        ai,
                     )
-                    if ai_data:
-                        data.update({
-                            key: value
-                            for key, value in ai_data.items()
-                            if value not in ('', None, [], {})
-                            and key not in {'source_url', 'raw_source_content', 'application_url'}
-                            and (key != 'description' or not data.get('description'))
-                        })
-                except AIProviderError:
-                    logger.warning(
-                        'AI extraction unavailable for Telegram source %s candidate %s; '
-                        'using explicit source fields only.',
+                    new_opportunities += int(bool(opportunity) and created)
+                except Exception as exc:
+                    safe_error = _safe_error_text(exc)
+                    safe_candidate_url = _safe_source_url(candidate.get('url', ''))
+                    candidate_errors.append({
+                        'telegram_source_id': source.pk,
+                        'message_id': message_id,
+                        'url': safe_candidate_url,
+                        'error': safe_error,
+                    })
+                    logger.error(
+                        'Telegram opportunity candidate failed for source %s (%s); continuing: %s',
                         source.pk,
-                        candidate.get('url', ''),
-                        exc_info=True,
+                        safe_candidate_url,
+                        safe_error,
                     )
-                data['raw_source_content'] = (
-                    candidate.get('raw_source_content')
-                    or candidate.get('text')
-                    or ''
-                )
-                opportunity, created = _upsert_opportunity(source, data)
-                if opportunity:
-                    new_opportunities += int(created)
-                    for profile in UserProfile.objects.select_related('user').filter(
-                        user__is_active=True,
+                    if (
+                        isinstance(message_id, int)
+                        and not isinstance(message_id, bool)
+                        and message_id > 0
                     ):
-                        result = compute_match_score(
-                            _profile_dict(profile),
-                            _opp_dict(opportunity),
-                        )
-                        _save_match(profile.user, opportunity, result)
-                        if result['eligible'] and profile.auto_apply:
-                            Application.objects.get_or_create(
-                                user=profile.user,
-                                opportunity=opportunity,
-                                defaults={
-                                    'match_score': result['score'],
-                                    'status': 'queued',
-                                },
+                        try:
+                            channel_identifier = source.channel_url.rstrip('/').split('/')[-1]
+                            retry_count = 1
+                            retry_status = (
+                                'dead_letter'
+                                if retry_count >= settings.TELEGRAM_POST_RETRY_MAX_ATTEMPTS
+                                else 'pending'
                             )
+                            defaults = {
+                                'channel_identifier': channel_identifier,
+                                'message_text': candidate.get('text', ''),
+                                'retry_count': retry_count,
+                                'status': retry_status,
+                                'last_error': safe_error,
+                                'next_retry_at': (
+                                    None
+                                    if retry_status == 'dead_letter'
+                                    else now + timedelta(
+                                        seconds=_telegram_retry_delay(retry_count),
+                                    )
+                                ),
+                            }
+                            record, created_record = TelegramMessageRetry.objects.get_or_create(
+                                source=source,
+                                message_id=message_id,
+                                defaults=defaults,
+                            )
+                            if not created_record and record.status != 'resolved':
+                                record.channel_identifier = channel_identifier
+                                record.message_text = candidate.get('text', '')
+                                record.retry_count += 1
+                                record.last_error = safe_error
+                                if record.retry_count >= settings.TELEGRAM_POST_RETRY_MAX_ATTEMPTS:
+                                    record.status = 'dead_letter'
+                                    record.next_retry_at = None
+                                else:
+                                    record.status = 'pending'
+                                    record.next_retry_at = now + timedelta(
+                                        seconds=_telegram_retry_delay(record.retry_count),
+                                    )
+                                record.save(update_fields=[
+                                    'channel_identifier', 'message_text',
+                                    'retry_count', 'last_error', 'status',
+                                    'next_retry_at', 'updated_at',
+                                ])
+                        except Exception as retry_exc:
+                            retry_error = _safe_error_text(retry_exc)
+                            stop_before_unpersisted_failure = True
+                            candidate_errors[-1]['retry_persistence_error'] = retry_error
+                            logger.error(
+                                'Could not persist Telegram retry for source %s message %s; '
+                                'cursor will not pass it: %s',
+                                source.pk,
+                                message_id,
+                                retry_error,
+                            )
+                    else:
+                        stop_before_unpersisted_failure = True
+                        candidate_errors[-1]['retry_persistence_error'] = (
+                            'Telegram message identifier is missing or invalid.'
+                        )
+                if isinstance(message_id, int) and not isinstance(message_id, bool):
+                    if not stop_before_unpersisted_failure:
+                        source.last_message_id = max(source.last_message_id, message_id)
+                        source.save(update_fields=['last_message_id', 'updated_at'])
+                if stop_before_unpersisted_failure:
+                    break
             source.status = 'active'
             source.error_count = 0
             source.last_successful_scan = now
@@ -371,14 +690,16 @@ def scan_telegram_sources_task(limit=10, telegram_source_ids=None):
             ])
             successful += 1
         except Exception as exc:
+            safe_error = _safe_error_text(exc)
             source.status = 'error'
             source.error_count += 1
             source.save(update_fields=['status', 'error_count', 'updated_at'])
-            errors.append({'telegram_source_id': source.pk, 'error': str(exc)})
-            logger.exception(
-                'Telegram opportunity source scan failed for source %s (%s).',
+            errors.append({'telegram_source_id': source.pk, 'error': safe_error})
+            logger.error(
+                'Telegram opportunity source scan failed for source %s (%s): %s',
                 source.pk,
-                source.channel_url,
+                _safe_source_url(source.channel_url),
+                safe_error,
             )
             from .services.audit import record_audit_event
 
@@ -386,7 +707,7 @@ def scan_telegram_sources_task(limit=10, telegram_source_ids=None):
                 record_audit_event(
                     'telegram_source_scan_failed',
                     source.pk,
-                    {'error_count': source.error_count, 'error': str(exc)[:1000]},
+                    {'error_count': source.error_count, 'error': safe_error[:1000]},
                 )
             except Exception:
                 logger.exception('Could not audit failed scan for Telegram source %s.', source.pk)
@@ -395,6 +716,8 @@ def scan_telegram_sources_task(limit=10, telegram_source_ids=None):
         'successful': successful,
         'telegram_source_ids': [source.pk for source in sources],
         'new_opportunities': new_opportunities,
+        'candidate_errors': candidate_errors,
+        'retry_results': retry_results,
         'errors': errors,
     }
 
@@ -416,13 +739,23 @@ def discover_sources_task():
                     record_audit_event(
                         'source_added',
                         source.pk,
-                        {'name': source.name, 'url': source.url, 'auto_discovered': True},
+                        {
+                            'name': source.name,
+                            'url': _safe_source_url(source.url),
+                            'auto_discovered': True,
+                        },
                     )
                 except Exception:
                     logger.exception('Could not audit discovered source %s.', source.pk)
         except Exception as exc:
-            logger.exception('Could not save discovered source %r.', item.get('url'))
-            errors.append({'url':item.get('url'), 'error':str(exc)})
+            safe_error = _safe_error_text(exc)
+            safe_url = _safe_source_url(item.get('url', ''))
+            logger.error(
+                'Could not save discovered source %s: %s',
+                safe_url,
+                safe_error,
+            )
+            errors.append({'url':safe_url, 'error':safe_error})
     return {'discovered':len(discovered),'created':len(created),'source_ids':created,'errors':errors}
 
 @shared_task
@@ -443,7 +776,16 @@ def process_application_queue_task(limit=20):
                 app.status = 'matching'
                 app.save(update_fields=['status','updated_at'])
             profile=UserProfile.objects.filter(user_id=app.user_id).first(); opp=app.opportunity
-            if not profile or opp.status!='active' or opp.is_expired(): app.status='needs_review'; app.error_message='Profile missing or opportunity is no longer active.'; app.save(update_fields=['status','error_message','updated_at']); continue
+            if not profile or opp.status != 'active' or opp.is_expired():
+                app.status='needs_review'
+                app.error_message='Profile missing or opportunity is no longer active.'
+                app.save(update_fields=['status','error_message','updated_at'])
+                continue
+            if is_listing_opportunity(opp):
+                app.status='needs_review'
+                app.error_message='Opportunity source is a listing page and is not publishable.'
+                app.save(update_fields=['status','error_message','updated_at'])
+                continue
             result=compute_match_score(_profile_dict(profile),_opp_dict(opp)); match,_=_save_match(app.user,opp,result); app.match_score=result['score']
             threshold_override = app.match_override and result['manual_override_allowed']
             if not result['eligible'] and not threshold_override:
@@ -481,9 +823,14 @@ def process_application_queue_task(limit=20):
             app.status='prepared'; app.error_message=''
             app.save(update_fields=['status','match_score','cover_letter','error_message','updated_at']); processed.append(app.pk)
         except Exception as exc:
-            logger.exception('Application preparation failed for application %s; continuing with the queue.', app.pk)
+            safe_error = _safe_error_text(exc)
+            logger.error(
+                'Application preparation failed for application %s; continuing with the queue: %s',
+                app.pk,
+                safe_error,
+            )
             app.status = 'failed'
-            app.error_message = f'Application preparation failed: {exc}'[:4000]
+            app.error_message = f'Application preparation failed: {safe_error}'[:4000]
             app.save(update_fields=['status', 'error_message', 'updated_at'])
     return {'processed':len(processed),'application_ids':processed}
 
@@ -501,20 +848,25 @@ def execute_application_queue_task(limit=10):
             if _execute_one_application(application_id):
                 done.append(application_id)
         except Exception as exc:
-            logger.exception(
-                'Application execution failed for application %s; continuing with the batch.',
+            safe_error = _safe_error_text(exc)
+            logger.error(
+                'Application execution failed for application %s; continuing with the batch: %s',
                 application_id,
+                safe_error,
             )
             try:
                 app = Application.objects.select_related('opportunity').get(pk=application_id)
                 if app.status in {'queued', 'matching', 'prepared'}:
                     app.status = 'failed'
-                    app.error_message = f'Application execution failed before submission: {exc}'[:4000]
+                    app.error_message = (
+                        'Application execution failed before submission: '
+                        f'{safe_error}'
+                    )[:4000]
                 elif app.status == 'pending':
                     app.status = 'needs_review'
                     app.error_message = (
                         'Application execution stopped after an attempt was reserved; '
-                        f'the submission outcome may be uncertain: {exc}'
+                        f'the submission outcome may be uncertain: {safe_error}'
                     )[:4000]
                 else:
                     continue
@@ -688,11 +1040,16 @@ def _execute_one_application(application_id):
     try:
         adapter_result = adapter.submit(app)
     except Exception as exc:
-        logger.exception('Application provider adapter failed for application %s.', app.pk)
+        safe_error = _safe_error_text(exc)
+        logger.error(
+            'Application provider adapter failed for application %s: %s',
+            app.pk,
+            safe_error,
+        )
         app.status = 'needs_review'
         app.error_message = (
             'Provider adapter raised an error after an attempt was reserved; '
-            f'the submission outcome may be uncertain: {exc}'
+            f'the submission outcome may be uncertain: {safe_error}'
         )[:4000]
         app.save(update_fields=['status','error_message','updated_at'])
         adapter_result = False
@@ -779,8 +1136,13 @@ def automation_cycle_task():
             if details[name].get('errors'):
                 stage_errors.append({'stage':name,'errors':details[name]['errors']})
         except Exception as exc:
-            logger.exception('Automation cycle stage %s failed; continuing with remaining stages.', name)
-            error={'stage':name,'error':str(exc)}
+            safe_error = _safe_error_text(exc)
+            logger.error(
+                'Automation cycle stage %s failed; continuing with remaining stages: %s',
+                name,
+                safe_error,
+            )
+            error={'stage':name,'error':safe_error}
             details[name]=error
             stage_errors.append(error)
     if stage_errors:

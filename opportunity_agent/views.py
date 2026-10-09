@@ -43,9 +43,23 @@ from .models import (
     set_website_visibility,
     validate_private_access_token,
 )
-from .services.matching import compute_match_score
+from .services.matching import (
+    compute_match_score,
+    opportunity_match_data,
+    profile_match_data,
+    refresh_user_matches,
+    save_match,
+)
 from .services.agent_conversations import process_user_message
 from .services.audit import record_audit_event
+from .services.source_ingestion import is_listing_opportunity
+
+
+def _public_opportunities(queryset):
+    return [
+        opportunity for opportunity in queryset
+        if not is_listing_opportunity(opportunity)
+    ]
 
 
 def _admin(request):
@@ -208,10 +222,13 @@ def signup(request):
     return render(request, 'registration/signup.html', {'form': form, 'registration_mode': registration_mode})
 
 def home(request):
+    opportunities = _public_opportunities(
+        Opportunity.objects.filter(status='active').order_by('-created_at')
+    )
     return render(request, 'opportunity_agent/home.html', {
         'title': 'Global Opportunity Agent',
-        'featured': Opportunity.objects.filter(status='active').order_by('-created_at')[:8],
-        'opportunity_count': Opportunity.objects.filter(status='active').count(),
+        'featured': opportunities[:8],
+        'opportunity_count': len(opportunities),
     })
 
 
@@ -293,7 +310,9 @@ def sitemap(request):
         SubElement(url_element, f'{{{namespace}}}loc').text = request.build_absolute_uri(
             reverse(route_name)
         )
-    for opportunity in Opportunity.objects.filter(status='active').order_by('pk')[:50000]:
+    for opportunity in _public_opportunities(
+        Opportunity.objects.filter(status='active').order_by('pk')
+    )[:50000]:
         url_element = SubElement(urlset, f'{{{namespace}}}url')
         SubElement(url_element, f'{{{namespace}}}loc').text = request.build_absolute_uri(
             reverse('opportunity_detail', args=[opportunity.pk])
@@ -311,12 +330,27 @@ def user_dashboard(request):
     _require_permission(request.user, 'opportunity_agent.view_match')
     profile, _ = UserProfile.objects.get_or_create(user=request.user)
     apps = Application.objects.filter(user=request.user)
-    matches = Match.objects.filter(
-        user=request.user,
-        eligible=True,
-        score__gte=profile.minimum_ai_match_score,
-        opportunity__status='active',
-    ).select_related('opportunity').order_by('-score', '-updated_at')[:8]
+    active_opportunities = _public_opportunities(
+        Opportunity.objects.filter(status='active').order_by('-created_at')
+    )
+    user_matches = refresh_user_matches(profile, active_opportunities)
+    matches = sorted(
+        (
+            match for match in user_matches.values()
+            if match.eligible
+            and match.score >= profile.minimum_ai_match_score
+        ),
+        key=lambda match: (match.score, match.updated_at),
+        reverse=True,
+    )[:8]
+    saved_opportunities = [
+        match for match in user_matches.values()
+        if match.is_saved and match.opportunity.status == 'active'
+    ]
+    saved_opportunities.sort(
+        key=lambda match: (match.updated_at, match.pk),
+        reverse=True,
+    )
     today = timezone.localdate()
     daily_count = apps.filter(
         Q(attempts_log__created_at__date=today)
@@ -330,11 +364,11 @@ def user_dashboard(request):
             updated_at__date=today,
         )
     ).distinct().count()
-    upcoming_deadlines = Opportunity.objects.filter(
+    upcoming_deadlines = _public_opportunities(Opportunity.objects.filter(
         status='active',
         deadline__gte=timezone.now(),
         deadline__lte=timezone.now() + timedelta(days=30),
-    ).order_by('deadline')[:8]
+    ).order_by('deadline'))[:8]
     applications_by_status = {
         'applied_opportunities': apps.filter(status='submitted')
         .select_related('opportunity').order_by('-submission_time', '-updated_at')[:8],
@@ -351,8 +385,10 @@ def user_dashboard(request):
         'submitted_count': apps.filter(status='submitted').count(), 'rejected_count': apps.filter(status='rejected').count(),
         'failed_count': apps.filter(status='failed').count(),
         'needs_review_count': apps.filter(status='needs_review').count(),
-        'active_opportunity_count': Opportunity.objects.filter(status='active').count(),
-        'daily_count': daily_count, 'daily_limit': profile.daily_application_limit, 'matches': matches,
+        'active_opportunity_count': len(active_opportunities),
+        'daily_count': daily_count, 'daily_limit': profile.daily_application_limit,
+        'matches': matches, 'saved_opportunities': saved_opportunities[:8],
+        'fallback_opportunities': active_opportunities[:8] if not matches else [],
         'upcoming_deadlines': upcoming_deadlines,
         **applications_by_status,
         'minimum_match_score': profile.minimum_ai_match_score,
@@ -360,7 +396,14 @@ def user_dashboard(request):
 
 def opportunity_list(request):
     qs = Opportunity.objects.filter(status='active').order_by('-created_at')
-    q = request.GET.get('q','').strip(); country=request.GET.get('country','').strip(); kind=request.GET.get('type','').strip(); mode=request.GET.get('mode','').strip(); remote=request.GET.get('remote')
+    q = request.GET.get('q', '').strip()
+    country = request.GET.get('country', '').strip()
+    kind = request.GET.get('type', '').strip()
+    mode = request.GET.get('mode', '').strip()
+    remote = request.GET.get('remote')
+    qualification = request.GET.get('qualification', '').strip()
+    deadline = request.GET.get('deadline', '').strip()
+    minimum_score = request.GET.get('minimum_score', '').strip()
     if q: qs=qs.filter(Q(title__icontains=q) | Q(organization__icontains=q) | Q(description__icontains=q))
     if country: qs=qs.filter(country__icontains=country)
     if kind: qs=qs.filter(opportunity_type=kind)
@@ -370,16 +413,93 @@ def opportunity_list(request):
         else:
             qs=qs.filter(work_mode=mode)
     if remote == '1': qs=qs.filter(remote_worldwide=True)
-    return render(request,'opportunity_agent/opportunity_list.html',{'opportunities':qs[:100],'types':Opportunity.OPPORTUNITY_TYPES,'work_modes':Opportunity.WORK_MODE_CHOICES,'q':q,'country':country,'kind':kind,'mode':mode,'remote':remote})
+    if qualification:
+        qs = qs.filter(
+            Q(education_requirements__icontains=qualification)
+            | Q(qualifications__icontains=qualification)
+            | Q(requirements__icontains=qualification)
+        )
+    if deadline == 'upcoming':
+        qs = qs.filter(deadline__gte=timezone.now())
+    elif deadline == 'none':
+        qs = qs.filter(deadline__isnull=True)
+    opportunities = _public_opportunities(qs)[:100]
+    profile = None
+    if request.user.is_authenticated:
+        profile, _ = UserProfile.objects.get_or_create(user=request.user)
+        matches = refresh_user_matches(profile, opportunities)
+        for opportunity in opportunities:
+            opportunity.user_match = matches.get(opportunity.pk)
+        if minimum_score.isdigit():
+            score_floor = min(100, int(minimum_score))
+            opportunities = [
+                opportunity for opportunity in opportunities
+                if opportunity.user_match
+                and opportunity.user_match.score >= score_floor
+            ]
+        opportunities.sort(
+            key=lambda opportunity: (
+                opportunity.user_match.score if opportunity.user_match else 0,
+                opportunity.created_at,
+            ),
+            reverse=True,
+        )
+    return render(request, 'opportunity_agent/opportunity_list.html', {
+        'opportunities': opportunities,
+        'types': Opportunity.OPPORTUNITY_TYPES,
+        'work_modes': Opportunity.WORK_MODE_CHOICES,
+        'q': q,
+        'country': country,
+        'kind': kind,
+        'mode': mode,
+        'remote': remote,
+        'qualification': qualification,
+        'deadline_filter': deadline,
+        'minimum_score': minimum_score,
+        'profile': profile,
+    })
 
 def opportunity_detail(request, pk):
-    opportunity=get_object_or_404(Opportunity,pk=pk)
+    opportunity=get_object_or_404(Opportunity,pk=pk,status='active')
+    if is_listing_opportunity(opportunity):
+        raise Http404
     match=Match.objects.filter(user=request.user,opportunity=opportunity).first() if request.user.is_authenticated else None
     match_result = None
     if request.user.is_authenticated:
         profile, _ = UserProfile.objects.get_or_create(user=request.user)
-        match_result = compute_match_score(profile_to_dict(profile), opportunity_to_dict(opportunity))
+        match_result = compute_match_score(
+            profile_match_data(profile),
+            opportunity_match_data(opportunity),
+        )
+        match, _ = save_match(request.user, opportunity, match_result)
     return render(request,'opportunity_agent/opportunity_detail.html',{'opportunity':opportunity,'match':match,'match_result':match_result})
+
+
+@login_required
+def toggle_saved_opportunity(request, pk):
+    if request.method != 'POST':
+        return HttpResponse('POST required.', status=405)
+    _require_permission(request.user, 'opportunity_agent.add_match')
+    action = request.POST.get('action')
+    if action not in {'save', 'unsave'}:
+        return HttpResponse('Invalid save action.', status=400)
+    opportunity = get_object_or_404(Opportunity, pk=pk, status='active')
+    if is_listing_opportunity(opportunity):
+        raise Http404
+    profile, _ = UserProfile.objects.get_or_create(user=request.user)
+    result = compute_match_score(
+        profile_match_data(profile),
+        opportunity_match_data(opportunity),
+    )
+    match, _ = save_match(request.user, opportunity, result)
+    match.is_saved = action == 'save'
+    match.save(update_fields=['is_saved', 'updated_at'])
+    messages.success(
+        request,
+        'Opportunity saved to your list.'
+        if match.is_saved else 'Opportunity removed from your saved list.',
+    )
+    return redirect('opportunity_detail', pk=pk)
 
 @login_required
 def apply_opportunity(request, pk):
@@ -387,6 +507,8 @@ def apply_opportunity(request, pk):
     _require_permission(request.user, 'opportunity_agent.add_application')
     _require_permission(request.user, 'opportunity_agent.add_match')
     opportunity=get_object_or_404(Opportunity,pk=pk,status='active')
+    if is_listing_opportunity(opportunity):
+        raise Http404
     if opportunity.is_expired():
         messages.error(request, 'This opportunity has expired.')
         return redirect('opportunity_detail',pk=pk)
@@ -611,8 +733,8 @@ def _analytics_context(request, template):
         'recent_applications':apps.select_related('user','opportunity').order_by('-created_at')[:10],'recent_runs':AutomationRun.objects.order_by('-started_at')[:8],
     })
 
-def profile_to_dict(p):
-    return {'skills':p.skills,'current_country':p.current_country,'target_countries':p.target_countries,'worldwide_preference':p.worldwide_preference,'preferred_opportunity_types':p.preferred_opportunity_types,'preferred_work_modes':p.preferred_work_modes,'visa_sponsorship_preference':p.visa_sponsorship_preference,'salary_stipend_preference':p.salary_stipend_preference,'minimum_ai_match_score':p.minimum_ai_match_score,'auto_apply':p.auto_apply,'education':p.education,'degree':p.degree,'certifications':p.certifications,'work_experience':p.work_experience,'languages':p.languages}
+def profile_to_dict(profile):
+    return profile_match_data(profile)
 
 def opportunity_to_dict(o):
-    return {'skills':o.skills,'country':o.country,'work_mode':o.work_mode,'remote_worldwide':o.remote_worldwide,'opportunity_type':o.opportunity_type,'visa_sponsorship':o.visa_sponsorship,'education_requirements':o.education_requirements,'experience_requirements':o.experience_requirements,'languages':o.languages,'salary_stipend':o.salary_stipend,'qualifications':o.qualifications,'requirements':o.requirements}
+    return opportunity_match_data(o)

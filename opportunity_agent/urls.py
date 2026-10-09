@@ -23,6 +23,11 @@ urlpatterns = [
     path('admin-dashboard/analytics/', views.analytics_dashboard, name='analytics_dashboard'),
     path('opportunities/', views.opportunity_list, name='opportunity_list'),
     path('opportunities/<int:pk>/', views.opportunity_detail, name='opportunity_detail'),
+    path(
+        'opportunities/<int:pk>/save/',
+        views.toggle_saved_opportunity,
+        name='toggle_saved_opportunity',
+    ),
     path('opportunities/<int:pk>/apply/', views.apply_opportunity, name='apply_opportunity'),
     path('opportunities/<int:pk>/apply/', views.apply_opportunity, name='create_application'),
     path('profile/', views.profile_edit, name='profile_edit'),

@@ -87,6 +87,12 @@ class UserProfile(models.Model):
             ),
         ]
 
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None:
+            kwargs['update_fields'] = set(update_fields) | {'updated_at'}
+        super().save(*args, **kwargs)
+
     @property
     def login_block_reason(self):
         if self.registration_status == 'pending':
@@ -241,6 +247,7 @@ class Source(models.Model):
     scan_frequency = models.CharField(max_length=24, choices=SCAN_FREQUENCIES, default='daily')
     last_scan = models.DateTimeField(blank=True, null=True)
     last_successful_scan = models.DateTimeField(blank=True, null=True)
+    candidate_scan_cursor = models.PositiveIntegerField(default=0)
     error_count = models.IntegerField(default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     notes = models.TextField(blank=True)
@@ -307,6 +314,14 @@ class Opportunity(models.Model):
         ('needs_review', 'Needs Review'),
         ('rejected', 'Rejected'),
     ]
+    APPLICATION_METHOD_CHOICES = [
+        ('online', 'Verified online application URL'),
+        ('form', 'Application form URL or file'),
+        ('email', 'Verified application email'),
+        ('telegram', 'Verified Telegram application contact'),
+        ('physical', 'Physical application address'),
+        ('source_only', 'Source page only; application method unverified'),
+    ]
 
     source = models.ForeignKey(Source, on_delete=models.SET_NULL, null=True, blank=True, related_name='opportunities')
     telegram_source = models.ForeignKey(
@@ -338,6 +353,13 @@ class Opportunity(models.Model):
     application_url = models.URLField(blank=True)
     application_form_url = models.URLField(blank=True)
     application_form_type = models.CharField(max_length=20, blank=True, choices=[('web','Web Form'),('pdf','PDF Form'),('docx','DOCX Form'),('other','Other')])
+    application_method = models.CharField(
+        max_length=20,
+        choices=APPLICATION_METHOD_CHOICES,
+        default='source_only',
+    )
+    application_methods = models.JSONField(default=list, blank=True)
+    application_instructions = models.TextField(blank=True)
     source_url = models.URLField(blank=True)
     contact_email = models.EmailField(blank=True)
     contact_phone = models.CharField(max_length=64, blank=True)
@@ -354,6 +376,23 @@ class Opportunity(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=['country', 'status']), models.Index(fields=['deadline']), models.Index(fields=['organization'])]
+
+    def save(self, *args, **kwargs):
+        method = self.application_method
+        if self.application_url:
+            method = 'online'
+        elif method == 'online':
+            method = 'form' if self.application_form_url else 'source_only'
+        elif self.application_form_url and method == 'source_only':
+            method = 'form'
+        elif method == 'form' and not self.application_form_url:
+            method = 'source_only'
+        if method != self.application_method:
+            self.application_method = method
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = set(update_fields) | {'application_method'}
+        super().save(*args, **kwargs)
 
     def is_expired(self):
         if self.deadline is None:
@@ -555,6 +594,7 @@ class TelegramSource(models.Model):
     )
     last_scan = models.DateTimeField(blank=True, null=True)
     last_successful_scan = models.DateTimeField(blank=True, null=True)
+    last_message_id = models.PositiveBigIntegerField(default=0)
     error_count = models.IntegerField(default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     notes = models.TextField(blank=True)
@@ -612,11 +652,61 @@ class TelegramSource(models.Model):
         return self.name
 
 
+class TelegramMessageRetry(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending retry'),
+        ('resolved', 'Resolved'),
+        ('dead_letter', 'Dead letter / manual review'),
+    ]
+
+    source = models.ForeignKey(
+        TelegramSource,
+        on_delete=models.CASCADE,
+        related_name='message_retries',
+    )
+    channel_identifier = models.CharField(max_length=255)
+    message_id = models.PositiveBigIntegerField()
+    message_text = models.TextField()
+    retry_count = models.PositiveSmallIntegerField(default=1)
+    next_retry_at = models.DateTimeField(blank=True, null=True)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='pending',
+    )
+    last_error = models.TextField(blank=True)
+    resolved_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['source', 'message_id'],
+                name='unique_telegram_source_message_retry',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['status', 'next_retry_at'],
+                name='opportunity_status_d4c39d_idx',
+            ),
+            models.Index(
+                fields=['source', 'status'],
+                name='opportunity_source__c82a6d_idx',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.channel_identifier}/{self.message_id} ({self.status})'
+
+
 class Match(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='opportunity_matches')
     opportunity = models.ForeignKey(Opportunity, on_delete=models.CASCADE, related_name='matches')
     score = models.PositiveSmallIntegerField(default=0)
     eligible = models.BooleanField(default=False)
+    is_saved = models.BooleanField(default=False)
     reasons = models.JSONField(default=list, blank=True)
     strong_matches = models.JSONField(default=list, blank=True)
     missing_requirements = models.JSONField(default=list, blank=True)

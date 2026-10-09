@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import logging
 import re
 import unicodedata
 from datetime import date, datetime
@@ -11,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 
+logger = logging.getLogger(__name__)
 
 TRACKING_PARAMETERS = {
     'fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid',
@@ -147,9 +149,12 @@ def _content_similarity(left: str, right: str) -> float:
 def _candidate_opportunities(data, canonical_url, fingerprint):
     from ..models import Opportunity
 
+    canonical_source_url = normalize_url(data.get('source_url') or '')
     exact = Q()
     if canonical_url:
         exact |= Q(normalized_application_url=canonical_url)
+    if canonical_source_url:
+        exact |= Q(source_url=canonical_source_url)
     if fingerprint:
         exact |= Q(content_fingerprint=fingerprint)
     candidates = list(Opportunity.objects.filter(exact).order_by('-updated_at')[:300]) if exact else []
@@ -179,6 +184,7 @@ def find_duplicate(data, *, raw_content=''):
     title = str(data.get('title') or '')
     organization = str(data.get('organization') or '')
     application_url = normalize_url(data.get('application_url') or '')
+    source_url = normalize_url(data.get('source_url') or '')
     deadline = data.get('deadline')
     content = raw_content or data.get('description') or ''
     fingerprint = content_fingerprint(title, organization, content, deadline)
@@ -188,6 +194,7 @@ def find_duplicate(data, *, raw_content=''):
     best_score = 0.0
     for candidate in candidates:
         old_app_url = candidate.normalized_application_url or normalize_url(candidate.application_url)
+        old_source_url = normalize_url(candidate.source_url)
         old_deadline = candidate.deadline
         if not _deadlines_compatible(deadline, old_deadline):
             continue
@@ -204,6 +211,7 @@ def find_duplicate(data, *, raw_content=''):
             and application_url == old_app_url
             and title_score >= 0.55
         )
+        same_source_url = bool(source_url and source_url == old_source_url)
         organization_score = _similarity(
             organization,
             candidate.organization,
@@ -219,6 +227,7 @@ def find_duplicate(data, *, raw_content=''):
 
         duplicate = (
             same_application_url
+            or same_source_url
             or same_content
             or (
                 known_organization
@@ -256,11 +265,42 @@ def _merge_missing_fields(existing, data, raw_content):
         'deadline', 'application_url', 'source_url', 'contact_email',
         'contact_phone', 'telegram_contact', 'physical_address',
         'organization_website', 'application_form_url', 'application_form_type',
+        'application_method', 'application_methods', 'application_instructions',
     )
     changed = []
     for field in fields:
         incoming = data.get(field)
         current = getattr(existing, field)
+        if field == 'application_method':
+            if incoming == 'online' and current != 'online':
+                setattr(existing, field, incoming)
+                changed.append(field)
+            elif current == 'source_only' and incoming in {
+                'form', 'email', 'telegram', 'physical',
+            }:
+                setattr(existing, field, incoming)
+                changed.append(field)
+            continue
+        if field == 'application_methods':
+            if not isinstance(incoming, list):
+                continue
+            merged = list(current) if isinstance(current, list) else []
+            for route in incoming:
+                if isinstance(route, dict) and route not in merged:
+                    merged.append(route)
+            if merged != current:
+                existing.application_methods = merged
+                changed.append(field)
+            continue
+        if field == 'application_instructions':
+            additions = str(incoming or '').strip()
+            current_instructions = str(current or '').strip()
+            if additions and additions not in current_instructions:
+                existing.application_instructions = '\n'.join(
+                    value for value in (current_instructions, additions) if value
+                )[:4000]
+                changed.append(field)
+            continue
         is_empty = current is None or current == '' or current == [] or current == {}
         if not is_empty or incoming is None or incoming == '' or incoming == [] or incoming == {}:
             continue
@@ -316,7 +356,12 @@ def deduplicate_and_save_opportunity(source, data, *, raw_content=''):
         return None, False
     data['_source_reference'] = source
     data['title'] = title[:255]
-    raw_content = str(raw_content or data.get('raw_source_content') or data.get('description') or '')[:60000]
+    raw_content = str(
+        raw_content
+        or data.get('raw_source_content')
+        or data.get('description')
+        or ''
+    )
     application_url = normalize_url(data.get('application_url') or '')
     fingerprint = content_fingerprint(
         data['title'],
@@ -342,7 +387,12 @@ def deduplicate_and_save_opportunity(source, data, *, raw_content=''):
     })
     try:
         with transaction.atomic():
-            opportunity = Opportunity.objects.create(**defaults)
+            opportunity, created = Opportunity.objects.get_or_create(
+                dedupe_hash=canonical_hash,
+                defaults=defaults,
+            )
+            if not created:
+                return _merge_missing_fields(opportunity, data, raw_content), False
             from .audit import record_audit_event
 
             record_audit_event(
@@ -360,6 +410,30 @@ def deduplicate_and_save_opportunity(source, data, *, raw_content=''):
         duplicate = find_duplicate(data, raw_content=raw_content)
         if duplicate:
             return _merge_missing_fields(duplicate, data, raw_content), False
+        collided = Opportunity.objects.filter(dedupe_hash=canonical_hash).first()
+        if collided:
+            if _deadlines_compatible(data.get('deadline'), collided.deadline):
+                return _merge_missing_fields(collided, data, raw_content), False
+            logger.warning(
+                'Opportunity deduplication hash collision for record %s; '
+                'preserving the distinct deadline record.',
+                collided.pk,
+            )
+            suffix = 1
+            while True:
+                alternate_hash = hashlib.sha256(
+                    f'{canonical_hash}:{_deadline_key(data.get("deadline"))}:{suffix}'.encode('utf-8')
+                ).hexdigest()
+                defaults['dedupe_hash'] = alternate_hash
+                try:
+                    with transaction.atomic():
+                        opportunity = Opportunity.objects.create(**defaults)
+                    return opportunity, True
+                except IntegrityError:
+                    if Opportunity.objects.filter(dedupe_hash=alternate_hash).exists():
+                        suffix += 1
+                        continue
+                    raise
         raise
 
 
@@ -376,6 +450,15 @@ def _opportunity_defaults(data, source, raw_content):
     work_mode = data.get('work_mode') or ''
     if work_mode not in {'on_site', 'hybrid', 'remote'}:
         work_mode = ''
+    application_method = data.get('application_method') or (
+        'online' if data.get('application_url') else
+        'form' if data.get('application_form_url') else
+        'source_only'
+    )
+    if application_method not in {
+        'online', 'form', 'email', 'telegram', 'physical', 'source_only',
+    }:
+        application_method = 'source_only'
     return {
         'source': source if isinstance(source, Source) else None,
         'telegram_source': source if isinstance(source, TelegramSource) else None,
@@ -401,11 +484,21 @@ def _opportunity_defaults(data, source, raw_content):
         'application_url': _bounded_text(data.get('application_url')),
         'application_form_url': _bounded_text(data.get('application_form_url')),
         'application_form_type': _bounded_text(data.get('application_form_type'), 20),
+        'application_method': application_method,
         'source_url': _bounded_text(data.get('source_url')),
         'contact_email': _bounded_text(data.get('contact_email'), 254),
         'contact_phone': _bounded_text(data.get('contact_phone'), 64),
         'telegram_contact': _bounded_text(data.get('telegram_contact'), 120),
         'physical_address': _bounded_text(data.get('physical_address')),
+        'application_methods': (
+            data.get('application_methods')
+            if isinstance(data.get('application_methods'), list)
+            else []
+        ),
+        'application_instructions': _bounded_text(
+            data.get('application_instructions'),
+            4000,
+        ),
         'organization_website': _bounded_text(data.get('organization_website')),
         'raw_source_content': raw_content,
         'status': 'inactive' if deadline and deadline < timezone.now() else 'active',

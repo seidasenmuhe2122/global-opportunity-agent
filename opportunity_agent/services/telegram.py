@@ -8,6 +8,13 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _safe_telegram_error(error, token):
+    message = str(error or 'Telegram delivery failed.')
+    if token:
+        message = message.replace(token, '[redacted]')
+    return message[:1000]
+
+
 class TelegramNotifier:
     def __init__(self,bot_token=None):
         self.bot_token=bot_token if bot_token is not None else os.environ.get('TELEGRAM_BOT_TOKEN','')
@@ -30,19 +37,26 @@ class TelegramNotifier:
                 response.raise_for_status()
                 data=response.json()
                 if not data.get('ok'):
-                    raise RuntimeError(data.get('description','Telegram rejected the message.'))
+                    raise RuntimeError(
+                        _safe_telegram_error(
+                            data.get('description', 'Telegram rejected the message.'),
+                            self.bot_token,
+                        ),
+                    )
                 return True
             except requests.RequestException as exc:
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 retryable = status is None or status == 429 or status >= 500
                 if not retryable or attempt == 2:
-                    raise
+                    details = f'HTTP {status}' if isinstance(status, int) else 'network request failed'
+                    raise RuntimeError(
+                        f'Telegram delivery failed ({details}).'
+                    ) from None
                 delay = 2 ** attempt
                 logger.warning(
                     'Transient Telegram delivery failure for chat %s; retrying in %s seconds.',
                     chat_id,
                     delay,
-                    exc_info=True,
                 )
                 time.sleep(delay)
         return False
@@ -60,20 +74,22 @@ class TelegramNotifier:
             try:
                 self.send_message(d.chat_id,message)
             except Exception as exc:
-                logger.exception(
-                    'Telegram notification failed for destination %s (%s).',
+                safe_error = _safe_telegram_error(exc, self.bot_token)
+                logger.error(
+                    'Telegram notification failed for destination %s (%s): %s',
                     d.pk,
                     d.name,
+                    safe_error,
                 )
                 try:
                     record_audit_event(
                         'telegram_notification_failed',
                         d.pk,
-                        {'type': kind, 'error': str(exc)[:1000]},
+                        {'type': kind, 'error': safe_error},
                     )
                 except Exception:
                     logger.exception('Could not audit Telegram notification failure for destination %s.', d.pk)
-                results.append({'id':d.pk,'sent':False,'error':str(exc)})
+                results.append({'id':d.pk,'sent':False,'error':safe_error})
                 continue
             try:
                 record_audit_event(

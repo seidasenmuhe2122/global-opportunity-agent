@@ -1,0 +1,25 @@
+.profile-progress {
+    display: block;
+    width: 100%;
+    height: 8px;
+    appearance: none;
+    border: 0;
+    border-radius: 99px;
+    overflow: hidden;
+    background: #1a2544;
+}
+
+.profile-progress::-webkit-progress-bar {
+    border-radius: 99px;
+    background: #1a2544;
+}
+
+.profile-progress::-webkit-progress-value {
+    border-radius: 99px;
+    background: linear-gradient(90deg, #39dfff, #a35fff);
+}
+
+.profile-progress::-moz-progress-bar {
+    border-radius: 99px;
+    background: linear-gradient(90deg, #39dfff, #a35fff);
+}

@@ -62,6 +62,46 @@
             {% if opportunity.salary_stipend %}<p><strong>Salary/Stipend:</strong> {{ opportunity.salary_stipend }}</p>{% endif %}
             <p><strong>Work mode:</strong> {% if opportunity.remote_worldwide %}Worldwide remote{% elif opportunity.work_mode %}{{ opportunity.get_work_mode_display }}{% else %}Not specified{% endif %}</p>
             <p><strong>Visa sponsorship:</strong> {% if opportunity.visa_sponsorship == True %}Available{% elif opportunity.visa_sponsorship == False %}Not available{% else %}Not specified{% endif %}</p>
+            <p><strong>Application method:</strong> {{ opportunity.get_application_method_display }}</p>
+            {% if opportunity.application_methods %}
+            {% if opportunity.application_method == 'source_only' %}
+            <p role="status"><strong>Needs review:</strong> The verified instructions do not map to a supported primary method; confirm the route on the official source page.</p>
+            {% endif %}
+            <p><strong>Verification:</strong> Source-identified application instructions and destinations.</p>
+            <ul class="application-routes">
+                {% for route in opportunity.application_methods %}
+                <li>
+                    <strong>{{ route.method|title }}</strong>
+                    {% if route.destination %}
+                        {% if route.method == 'online' or route.method == 'form' %}
+                            <a class="text-link" href="{{ route.destination }}" target="_blank" rel="noopener">{{ route.destination }}</a>
+                        {% elif route.method == 'email' %}
+                            <a class="text-link" href="mailto:{{ route.destination }}">{{ route.destination }}</a>
+                        {% elif route.method == 'phone' %}
+                            <a class="text-link" href="tel:{{ route.destination }}">{{ route.destination }}</a>
+                        {% else %}
+                            <span>{{ route.destination }}</span>
+                        {% endif %}
+                    {% endif %}
+                    {% if route.instructions %}<p>{{ route.instructions }}</p>{% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+            {% elif opportunity.application_method == 'source_only' %}
+            <p role="status"><strong>Needs review:</strong> No application method was verified in the source; review the source page before proceeding.</p>
+            {% else %}
+            <p><strong>Verification:</strong> Existing verified application method. Confirm the instructions on the official source page.</p>
+            {% if opportunity.application_method == 'email' and opportunity.contact_email %}
+            <p><strong>Verified application email:</strong> <a class="text-link" href="mailto:{{ opportunity.contact_email }}">{{ opportunity.contact_email }}</a></p>
+            {% elif opportunity.application_method == 'telegram' and opportunity.telegram_contact %}
+            <p><strong>Verified Telegram application contact:</strong> {{ opportunity.telegram_contact }}</p>
+            {% elif opportunity.application_method == 'physical' and opportunity.physical_address %}
+            <p><strong>Verified application address:</strong> {{ opportunity.physical_address|linebreaksbr }}</p>
+            {% endif %}
+            {% endif %}
+            {% if not opportunity.application_methods and opportunity.application_instructions %}
+            <p><strong>Application instructions:</strong> {{ opportunity.application_instructions|linebreaksbr }}</p>
+            {% endif %}
             <form method="post" action="/opportunities/{{ opportunity.pk }}/apply/">
                 {% csrf_token %}
                 {% if match_result.manual_override_allowed %}
@@ -72,12 +112,19 @@
                 {% endif %}
                 <button class="button" style="width:100%" type="submit">🚀 Add to application queue</button>
             </form>
-            {% if opportunity.application_url %}<p style="margin-top:15px"><a class="text-link" href="{{ opportunity.application_url }}" target="_blank" rel="noopener">Open official application page →</a></p>{% else %}<p style="margin-top:15px">No application URL was identified. {% if opportunity.contact_email or opportunity.contact_phone or opportunity.telegram_contact or opportunity.physical_address or opportunity.organization_website %}Use the verified contact details below to request application instructions.{% else %}No contact destination was identified. Visit the source page for instructions.{% endif %}</p>{% endif %}
+            {% if opportunity.application_url and not opportunity.application_methods %}<p style="margin-top:15px"><a class="text-link" href="{{ opportunity.application_url }}" target="_blank" rel="noopener">Open official application page →</a></p>{% elif opportunity.application_form_url and not opportunity.application_methods %}<p style="margin-top:15px"><a class="text-link" href="{{ opportunity.application_form_url }}" target="_blank" rel="noopener">Open application form →</a></p>{% endif %}
             {% if opportunity.source_url %}<p><a class="text-link" href="{{ opportunity.source_url }}" target="_blank" rel="noopener">View source →</a></p>{% endif %}
+            {% if user.is_authenticated %}
+            <form method="post" action="{% url 'toggle_saved_opportunity' opportunity.pk %}">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="{% if match.is_saved %}unsave{% else %}save{% endif %}">
+                <button class="button" style="width:100%;margin-top:10px" type="submit">{% if match.is_saved %}Remove from saved opportunities{% else %}Save opportunity{% endif %}</button>
+            </form>
+            {% endif %}
         </div>
         {% if opportunity.contact_email or opportunity.contact_phone or opportunity.telegram_contact or opportunity.physical_address or opportunity.organization_website %}
         <div class="detail-card" style="margin-top:15px">
-            <h2 style="margin-top:0">{% if opportunity.application_url %}Contact information{% else %}Contact to apply{% endif %}</h2>
+            <h2 style="margin-top:0">Contact information</h2>
             <div class="contact-box">
                 {% if opportunity.contact_email %}<p><strong>Email:</strong> <a class="text-link" href="mailto:{{ opportunity.contact_email }}">{{ opportunity.contact_email }}</a></p>{% endif %}
                 {% if opportunity.contact_phone %}<p><strong>Phone:</strong> <a class="text-link" href="tel:{{ opportunity.contact_phone }}">{{ opportunity.contact_phone }}</a></p>{% endif %}

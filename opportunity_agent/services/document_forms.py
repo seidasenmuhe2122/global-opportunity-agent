@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
-import requests
 from django.core.files.base import ContentFile
 from pypdf import PdfReader, PdfWriter
 from docx import Document
+from .public_http import get_public_response
 
 
 def token_value(token, profile, application):
@@ -23,9 +23,15 @@ def token_value(token, profile, application):
 
 
 def download_form(url, timeout=30):
-    r=requests.get(url, timeout=timeout, allow_redirects=True, headers={'User-Agent':'OpportunityAgent/1.0'})
-    r.raise_for_status()
-    return r.content, r.headers.get('content-type','')
+    response = get_public_response(
+        url,
+        timeout=timeout,
+        headers={'User-Agent': 'OpportunityAgent/1.0'},
+    )
+    try:
+        return response.content, response.headers.get('content-type', '')
+    finally:
+        response.close()
 
 
 def fill_pdf(template_file, field_map, profile, application):

@@ -3,7 +3,7 @@
 <section class="panel" style="padding:18px;margin-bottom:18px">
     <h2>Profile completeness</h2>
     <p>Automatic applications are held for review until all required profile sections are complete.</p>
-    <div class="progress-track"><div class="progress-fill" style="width:{{ profile.profile_completeness }}%"></div></div>
+    <progress class="profile-progress" value="{{ profile.profile_completeness }}" max="100" aria-label="Profile completeness"></progress>
     <div class="form-grid" style="margin-top:14px">
         {% for section in profile.profile_completeness_sections %}
         <div class="form-field">

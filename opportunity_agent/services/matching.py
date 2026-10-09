@@ -2,6 +2,155 @@ import re
 from typing import Any
 
 
+CAREER_INTEREST_PATTERNS = {
+    'management and coordination': re.compile(
+        r'\b(?:management|manager|administration|administrator|leadership|leader|'
+        r'operations|project coordination|coordinator|supervisor|planning)\b',
+        re.I,
+    ),
+    'software and technology': re.compile(
+        r'\b(?:software|programming|programmer|developer|development|python|django|'
+        r'web|information technology|technology|data science|cybersecurity|'
+        r'computer science|database|networking|it support)\b',
+        re.I,
+    ),
+    'research and higher education': re.compile(
+        r'\b(?:research|scholarship|fellowship|grant|ph\.?d|doctoral|university|'
+        r'undergraduate|postgraduate|graduate study|academic|student)\b',
+        re.I,
+    ),
+    'finance and accounting': re.compile(
+        r'\b(?:finance|financial|accounting|accountant|audit|economics|budget)\b',
+        re.I,
+    ),
+    'engineering': re.compile(
+        r'\b(?:engineering|engineer|civil|mechanical|electrical|construction)\b',
+        re.I,
+    ),
+    'health': re.compile(
+        r'\b(?:health|healthcare|medical|nursing|public health|clinical)\b',
+        re.I,
+    ),
+    'agriculture and environment': re.compile(
+        r'\b(?:agriculture|agricultural|farming|environment|environmental|'
+        r'conservation|climate)\b',
+        re.I,
+    ),
+    'communications': re.compile(
+        r'\b(?:communications|communication|journalism|media|marketing|'
+        r'public relations|writing)\b',
+        re.I,
+    ),
+}
+
+
+def profile_match_data(profile):
+    return {
+        'skills': profile.skills,
+        'current_country': profile.current_country,
+        'target_countries': profile.target_countries,
+        'worldwide_preference': profile.worldwide_preference,
+        'preferred_opportunity_types': profile.preferred_opportunity_types,
+        'preferred_work_modes': profile.preferred_work_modes,
+        'visa_sponsorship_preference': profile.visa_sponsorship_preference,
+        'salary_stipend_preference': profile.salary_stipend_preference,
+        'minimum_ai_match_score': profile.minimum_ai_match_score,
+        'auto_apply': profile.auto_apply,
+        'education': profile.education,
+        'degree': profile.degree,
+        'work_experience': profile.work_experience,
+        'languages': profile.languages,
+        'certifications': profile.certifications,
+    }
+
+
+def opportunity_match_data(opportunity):
+    return {
+        'title': opportunity.title,
+        'organization': opportunity.organization,
+        'description': opportunity.description,
+        'responsibilities': opportunity.responsibilities,
+        'requirements': opportunity.requirements,
+        'qualifications': opportunity.qualifications,
+        'education_requirements': opportunity.education_requirements,
+        'experience_requirements': opportunity.experience_requirements,
+        'skills': opportunity.skills,
+        'country': opportunity.country,
+        'city': opportunity.city,
+        'work_mode': opportunity.work_mode,
+        'remote_worldwide': opportunity.remote_worldwide,
+        'opportunity_type': opportunity.opportunity_type,
+        'visa_sponsorship': opportunity.visa_sponsorship,
+        'languages': opportunity.languages,
+        'salary_stipend': opportunity.salary_stipend,
+        'benefits': opportunity.benefits,
+    }
+
+
+def save_match(user, opportunity, result):
+    from ..models import Match
+
+    match, created = Match.objects.update_or_create(
+        user=user,
+        opportunity=opportunity,
+        defaults={
+            'score': result['score'],
+            'eligible': result['eligible'],
+            'reasons': result['reasons'],
+            'strong_matches': result.get('strong_matches', []),
+            'missing_requirements': result['missing'],
+            'risk_factors': result.get('risks', []),
+            'recommended_action': result.get('recommended_action', ''),
+        },
+    )
+    if created:
+        from .audit import record_audit_event
+
+        record_audit_event(
+            'opportunity_matched',
+            match.pk,
+            {
+                'user_id': user.pk,
+                'opportunity_id': opportunity.pk,
+                'score': result['score'],
+                'eligible': result['eligible'],
+            },
+        )
+    return match, created
+
+
+def refresh_user_matches(profile, opportunities):
+    from ..models import Match
+
+    opportunities = list(opportunities)
+    opportunity_ids = [opportunity.pk for opportunity in opportunities]
+    matches = {
+        match.opportunity_id: match
+        for match in Match.objects.filter(
+            user_id=profile.user_id,
+            opportunity_id__in=opportunity_ids,
+        )
+    }
+    for opportunity in opportunities:
+        match = matches.get(opportunity.pk)
+        if (
+            match is not None
+            and match.updated_at >= profile.updated_at
+            and match.updated_at >= opportunity.updated_at
+        ):
+            continue
+        result = compute_match_score(
+            profile_match_data(profile),
+            opportunity_match_data(opportunity),
+        )
+        matches[opportunity.pk], _created = save_match(
+            profile.user,
+            opportunity,
+            result,
+        )
+    return matches
+
+
 def _items(value):
     if isinstance(value, str):
         return [part.strip() for part in re.split(r'[,;\n]+', value) if part.strip()]
@@ -111,13 +260,48 @@ def _generic_requirement_assessment(user, requirements):
                 conflicts.append(clause)
             continue
 
-        if re.search(r'\b(?:must|only|eligible|required|requires?|minimum|at least)\b', normalized) and not re.search(
+        if re.search(
+            r'\b(?:must|only|eligible|required|requires?|minimum|at least|'
+            r'need(?:s)? to|have to|has to|expected to|should)\b',
+            normalized,
+        ) and not re.search(
             r'\b(?:submit|provide|send|upload|attach|include|apply|contact)\b',
             normalized,
         ):
             unconfirmed.append(clause)
 
     return conflicts, unconfirmed
+
+
+def _career_interest_matches(user, opportunity):
+    profile_text = ' '.join(filter(None, (
+        ' '.join(_items(user.get('skills'))),
+        _text(user.get('degree')),
+        _text(user.get('education')),
+        _text(user.get('work_experience')),
+        ' '.join(_items(user.get('certifications'))),
+        ' '.join(_items(user.get('preferred_opportunity_types'))),
+    )))
+    opportunity_text = ' '.join(filter(None, (
+        _text(opportunity.get('title')),
+        _text(opportunity.get('organization')),
+        _text(opportunity.get('opportunity_type')),
+        _text(opportunity.get('description')),
+        _text(opportunity.get('responsibilities')),
+        _text(opportunity.get('requirements')),
+        _text(opportunity.get('qualifications')),
+        _text(opportunity.get('education_requirements')),
+        _text(opportunity.get('experience_requirements')),
+        ' '.join(_items(opportunity.get('skills'))),
+    )))
+    profile_interests = {
+        interest for interest, pattern in CAREER_INTEREST_PATTERNS.items()
+        if pattern.search(profile_text)
+    }
+    return sorted(
+        interest for interest in profile_interests
+        if CAREER_INTEREST_PATTERNS[interest].search(opportunity_text)
+    )
 
 
 def compute_match_score(user_profile: dict[str, Any], opportunity: dict[str, Any]) -> dict[str, Any]:
@@ -129,7 +313,15 @@ def compute_match_score(user_profile: dict[str, Any], opportunity: dict[str, Any
     risks = []
     generic_requirement_conflicts, generic_requirements_unconfirmed = _generic_requirement_assessment(
         user,
-        opp.get('requirements'),
+        '\n'.join(
+            str(opp.get(field) or '')
+            for field in (
+                'requirements',
+                'qualifications',
+                'education_requirements',
+                'experience_requirements',
+            )
+        ),
     )
     if generic_requirement_conflicts:
         missing.append(
@@ -154,7 +346,19 @@ def compute_match_score(user_profile: dict[str, Any], opportunity: dict[str, Any
         'visa_sponsorship': 0,
         'preferences': 0,
         'qualifications': 0,
+        'career_interests': 0,
     }
+
+    matched_interests = _career_interest_matches(user, opp)
+    if matched_interests:
+        points['career_interests'] = min(20, 20 * len(matched_interests))
+        reasons.append(
+            'Your profile career interests relate to this opportunity: '
+            + ', '.join(matched_interests) + '.'
+        )
+        strong_matches.append(
+            'Career-interest overlap: ' + ', '.join(matched_interests) + '.'
+        )
 
     user_skills = _norm(user.get('skills'))
     required_skills = _norm(opp.get('skills'))
@@ -362,6 +566,7 @@ def compute_match_score(user_profile: dict[str, Any], opportunity: dict[str, Any
         'qualifications',
     ))
     score = max(0, min(100, round(core_score + additional_score * 25 / 45)))
+    score = min(100, score + points['career_interests'])
     threshold = _threshold(user.get('minimum_ai_match_score', 75))
     threshold_met = score >= threshold
     generic_requirements_clear = not generic_requirement_conflicts and not generic_requirements_unconfirmed

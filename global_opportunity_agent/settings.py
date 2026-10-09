@@ -236,6 +236,44 @@ BROWSER_HEADLESS = os.environ.get('BROWSER_HEADLESS', '1').strip().lower() not i
 BROWSER_TIMEOUT_MS = int(os.environ.get('BROWSER_TIMEOUT_MS', '30000'))
 if BROWSER_TIMEOUT_MS < 1000:
     raise ImproperlyConfigured('BROWSER_TIMEOUT_MS must be at least 1000.')
+try:
+    SOURCE_CANDIDATE_BATCH_SIZE = int(os.environ.get('SOURCE_CANDIDATE_BATCH_SIZE', '50'))
+except ValueError as exc:
+    raise ImproperlyConfigured('SOURCE_CANDIDATE_BATCH_SIZE must be an integer between 1 and 200.') from exc
+if not 1 <= SOURCE_CANDIDATE_BATCH_SIZE <= 200:
+    raise ImproperlyConfigured('SOURCE_CANDIDATE_BATCH_SIZE must be an integer between 1 and 200.')
+
+def _positive_int_setting(name, default, maximum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ImproperlyConfigured(
+            f'{name} must be an integer between 1 and {maximum}.'
+        ) from exc
+    if not 1 <= value <= maximum:
+        raise ImproperlyConfigured(
+            f'{name} must be an integer between 1 and {maximum}.'
+        )
+    return value
+
+TELEGRAM_POST_RETRY_MAX_ATTEMPTS = _positive_int_setting(
+    'TELEGRAM_POST_RETRY_MAX_ATTEMPTS', 5, 20,
+)
+TELEGRAM_POST_RETRY_BASE_SECONDS = _positive_int_setting(
+    'TELEGRAM_POST_RETRY_BASE_SECONDS', 60, 86400,
+)
+TELEGRAM_POST_RETRY_MAX_SECONDS = _positive_int_setting(
+    'TELEGRAM_POST_RETRY_MAX_SECONDS', 21600, 604800,
+)
+DISCOVERY_MAX_PER_CYCLE = _positive_int_setting(
+    'DISCOVERY_MAX_PER_CYCLE', 20, 100,
+)
+DISCOVERY_PAGE_SIZE = _positive_int_setting(
+    'DISCOVERY_PAGE_SIZE', 20, 100,
+)
+APPLICATION_WORKFLOW_BUDGET_SECONDS = _positive_int_setting(
+    'APPLICATION_WORKFLOW_BUDGET_SECONDS', 900, 86400,
+)
 
 CELERY_BROKER_URL = (os.environ.get('CELERY_BROKER_URL') or REDIS_URL).strip()
 CELERY_RESULT_BACKEND = (os.environ.get('CELERY_RESULT_BACKEND') or REDIS_URL).strip()

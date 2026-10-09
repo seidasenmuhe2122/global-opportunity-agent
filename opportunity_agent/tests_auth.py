@@ -963,14 +963,55 @@ class EmailAuthenticationTests(TestCase):
         response = self.client.get(reverse('opportunity_detail', args=[opportunity.pk]))
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'No application URL was identified.')
-        self.assertContains(response, 'Contact to apply')
+        self.assertContains(response, 'No application method was verified in the source')
+        self.assertContains(response, 'Contact information')
         self.assertContains(response, 'apply@example.org')
         self.assertContains(response, '+1 212 555 1234')
         self.assertContains(response, 'https://t.me/example_apply')
         self.assertContains(response, '1 Research Road, Nairobi')
         self.assertContains(response, 'Organization website:')
         self.assertContains(response, 'View source')
+
+    def test_opportunity_detail_displays_verified_alternatives_and_source_only_warning(self):
+        verified = Opportunity.objects.create(
+            title='Email and portal opportunity',
+            application_method='online',
+            application_url='https://apply.example.org/entry',
+            application_methods=[
+                {
+                    'method': 'online',
+                    'destination': 'https://apply.example.org/entry',
+                    'instructions': 'Submit the application through the portal.',
+                },
+                {
+                    'method': 'email',
+                    'destination': 'cv@example.org',
+                    'instructions': 'Alternatively, email your CV.',
+                },
+            ],
+            application_instructions=(
+                'Submit the application through the portal. Alternatively, email your CV.'
+            ),
+            source_url='https://source.example.org/opportunities/verified',
+            dedupe_hash='verified-alternative-method-detail-test',
+        )
+        response = self.client.get(reverse('opportunity_detail', args=[verified.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Source-identified application instructions and destinations.')
+        self.assertContains(response, 'Alternatively, email your CV.')
+        self.assertContains(response, 'mailto:cv@example.org')
+
+        source_only = Opportunity.objects.create(
+            title='Unverified application opportunity',
+            application_method='source_only',
+            source_url='https://source.example.org/opportunities/unverified',
+            dedupe_hash='source-only-warning-detail-test',
+        )
+        response = self.client.get(reverse('opportunity_detail', args=[source_only.pk]))
+        self.assertContains(response, 'Needs review:')
+        self.assertContains(response, source_only.source_url)
+        self.assertNotContains(response, 'Open official application page')
 
 
 class RolePermissionTests(TestCase):
@@ -1490,17 +1531,33 @@ class UserDataPrivacyTests(TestCase):
             dedupe_hash='owner-private-application',
         )
         other_opportunity = Opportunity.objects.create(
-            title='Other Private Application',
+            title='Other Public Opportunity',
             dedupe_hash='other-private-application',
         )
-        Application.objects.create(user=self.owner, opportunity=own_opportunity)
-        Application.objects.create(user=self.other, opportunity=other_opportunity)
+        own_application = Application.objects.create(
+            user=self.owner,
+            opportunity=own_opportunity,
+        )
+        other_application = Application.objects.create(
+            user=self.other,
+            opportunity=other_opportunity,
+            status='submitted',
+            rejection_reason='Private application decision.',
+        )
         self.client.force_login(self.owner)
 
         response = self.client.get(reverse('user_dashboard'))
 
         self.assertContains(response, own_opportunity.title)
-        self.assertNotContains(response, other_opportunity.title)
+        self.assertEqual(
+            [application.pk for application in response.context['applications']],
+            [own_application.pk],
+        )
+        self.assertNotIn(
+            other_application.pk,
+            [application.pk for application in response.context['applications']],
+        )
+        self.assertNotContains(response, 'Private application decision.')
 
     def test_cv_is_only_downloadable_by_its_owner_or_authorized_profile_admin(self):
         with TemporaryDirectory() as media_root:

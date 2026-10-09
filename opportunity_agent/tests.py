@@ -1,12 +1,19 @@
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.core.management.base import CommandError
 from django.db import IntegrityError, transaction
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from datetime import timedelta
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 import socket
 import json
+import ipaddress
 
 import requests
 
@@ -19,6 +26,7 @@ from .models import (
     Opportunity,
     ProviderAdapter,
     Source,
+    TelegramMessageRetry,
     TelegramDestination,
     TelegramSource,
     UserProfile,
@@ -29,7 +37,12 @@ from .services.deduplication import (
     deduplicate_and_save_opportunity,
     normalize_url,
 )
-from .services.matching import compute_match_score
+from .services.matching import (
+    compute_match_score,
+    opportunity_match_data,
+    profile_match_data,
+    refresh_user_matches,
+)
 from .services.ai_engine import AIClient, AIProviderError
 
 User = get_user_model()
@@ -38,6 +51,12 @@ User = get_user_model()
 class OpportunityAgentTestCase(TestCase):
     def setUp(self):
         call_command('setup_roles')
+        self.public_destination_validation = patch(
+            'opportunity_agent.services.source_ingestion.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        )
+        self.public_destination_validation.start()
+        self.addCleanup(self.public_destination_validation.stop)
         self.user = User.objects.create_user(username='alice', email='alice@example.com', password='StrongPass123!')
         self.user.groups.add(self.user.groups.model.objects.get(name='USER'))
         self.profile, _ = UserProfile.objects.get_or_create(
@@ -238,6 +257,40 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(candidates[0]['url'], 'https://api.example.com/fellowships/1')
         self.assertEqual(candidates[0]['source_landing_url'], api_source.url)
 
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_api_application_url_is_not_used_as_detail_or_source_url(self, public_addresses):
+        from .services.source_ingestion import basic_extract, extract_candidates
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        api_source = Source(
+            name='Public API with application destinations',
+            url='https://api.example.com/opportunities',
+            source_type='api',
+        )
+        candidate = next(extract_candidates(
+            api_source,
+            api_source.url,
+            json.dumps({
+                'items': [{
+                    'title': 'Research Fellowship',
+                    'link': '/fellowships/42',
+                    'application_url': 'https://apply.example.org/forms/42',
+                    'description': 'A specific research fellowship.',
+                }],
+            }),
+        ))
+
+        extracted = basic_extract(candidate, api_source)
+
+        self.assertEqual(candidate['url'], 'https://api.example.com/fellowships/42')
+        self.assertEqual(candidate['source_landing_url'], api_source.url)
+        self.assertEqual(extracted['source_url'], 'https://api.example.com/fellowships/42')
+        self.assertEqual(
+            extracted['application_url'],
+            'https://apply.example.org/forms/42',
+        )
+        self.assertEqual(extracted['application_method'], 'online')
+
     def test_extraction_preserves_explicit_api_fields_and_leaves_unknowns_empty(self):
         from .services.source_ingestion import basic_extract, extract_candidates
         from .tasks import _upsert_opportunity
@@ -300,6 +353,38 @@ class OpportunityAgentTestCase(TestCase):
             details__source_id=source.pk,
         ).exists())
 
+    def test_extraction_normalizes_nested_requirement_lists_and_string_skills(self):
+        from .services.source_ingestion import basic_extract
+
+        extracted = basic_extract(
+            {
+                'title': 'Structured Requirements Fellowship',
+                'url': 'https://example.org/fellowship',
+                'source_landing_url': 'https://example.org/opportunities',
+                'text': '',
+                'data': {
+                    'requirements': [
+                        {'text': 'Must be enrolled in a graduate program.'},
+                        {'text': 'Submit a writing sample.'},
+                    ],
+                    'qualifications': [{'text': 'Masters degree.'}],
+                    'education_requirements': [{'text': 'Masters degree required.'}],
+                    'experience_requirements': [{'text': 'Two years of research.'}],
+                    'skills': 'Python, data analysis',
+                },
+            },
+            self.source,
+        )
+
+        self.assertEqual(
+            extracted['requirements'],
+            'Must be enrolled in a graduate program.; Submit a writing sample.',
+        )
+        self.assertEqual(extracted['qualifications'], 'Masters degree.')
+        self.assertEqual(extracted['education_requirements'], 'Masters degree required.')
+        self.assertEqual(extracted['experience_requirements'], 'Two years of research.')
+        self.assertEqual(extracted['skills'], ['Python', 'data analysis'])
+
     def test_extraction_does_not_infer_missing_opportunity_facts(self):
         from .services.source_ingestion import basic_extract
 
@@ -324,6 +409,7 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(extracted['contact_phone'], '')
         self.assertEqual(extracted['telegram_contact'], '')
         self.assertEqual(extracted['organization_website'], '')
+        self.assertEqual(extracted['application_method'], 'source_only')
 
     def test_extraction_finds_explicit_contact_destinations_without_application_url(self):
         from .services.source_ingestion import basic_extract
@@ -349,10 +435,185 @@ class OpportunityAgentTestCase(TestCase):
 
         self.assertEqual(extracted['application_url'], '')
         self.assertEqual(extracted['contact_email'], 'fellowships@example.org')
+        self.assertEqual(extracted['application_method'], 'source_only')
         self.assertEqual(extracted['contact_phone'], '+1 212 555 1234')
         self.assertEqual(extracted['telegram_contact'], 'https://t.me/example_fellowships')
         self.assertEqual(extracted['physical_address'], '1 Research Road, Nairobi')
         self.assertEqual(extracted['organization_website'], 'https://example.org/about')
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_alternative_application_methods_require_explicit_application_instructions(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        telegram = basic_extract({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/fellowship',
+            'text': 'Apply via Telegram: https://t.me/example_fellowship',
+            'html': '<a href="https://t.me/example_fellowship">Example fellowship contact</a>',
+        }, self.source)
+        physical = basic_extract({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/fellowship',
+            'text': 'Mail your application to the address below.',
+            'html': '<address>1 Research Road, Nairobi</address>',
+        }, self.source)
+        general_contact = basic_extract({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/fellowship',
+            'text': 'For more information, contact fellowships@example.org.',
+            'html': '',
+        }, self.source)
+
+        self.assertEqual(telegram['application_method'], 'telegram')
+        self.assertEqual(telegram['telegram_contact'], 'https://t.me/example_fellowship')
+        self.assertEqual(physical['application_method'], 'physical')
+        self.assertEqual(physical['physical_address'], '1 Research Road, Nairobi')
+        self.assertEqual(general_contact['application_method'], 'source_only')
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_general_telegram_channel_is_not_extracted_as_application_route(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        extracted = basic_extract({
+            'title': 'OD Mentorship',
+            'url': 'https://opportunitydesk.org/od-mentorship/',
+            'text': (
+                'Mentees receive application advice. For help, send materials by '
+                'email. Telegram Facebook X Instagram Telegram'
+            ),
+            'html': (
+                '<p>To become a mentee, send complete materials by email.</p>'
+                '<footer><a href="https://t.me/opportunitydesk/">Telegram</a></footer>'
+            ),
+        }, self.source)
+
+        self.assertEqual(extracted['telegram_contact'], 'https://t.me/opportunitydesk/')
+        self.assertNotIn(
+            'telegram',
+            {route['method'] for route in extracted['application_methods']},
+        )
+        self.assertNotEqual(extracted['application_method'], 'telegram')
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_application_methods_are_extracted_only_from_explicit_instructions(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        cases = (
+            (
+                'email',
+                'To apply, email your CV and supporting documents to '
+                'applications@example.org.',
+                '',
+                'email',
+            ),
+            (
+                'telegram',
+                'Apply by contacting our coordinator on Telegram at '
+                'https://t.me/apply_team.',
+                '<a href="https://t.me/apply_team">Telegram application contact</a>',
+                'telegram',
+            ),
+            (
+                'physical',
+                'Applicants must deliver their application in person to '
+                '1 Research Road, Nairobi.',
+                '<address>1 Research Road, Nairobi</address>',
+                'physical',
+            ),
+            (
+                'phone',
+                'To apply by phone, call +1 212 555 1234.',
+                '<a href="tel:+12125551234">Application phone</a>',
+                'phone',
+            ),
+        )
+        for index, (label, text, markup, route_method) in enumerate(cases):
+            with self.subTest(method=label):
+                extracted = basic_extract({
+                    'title': f'{label.title()} opportunity',
+                    'url': f'https://example.org/opportunities/{index}',
+                    'text': text,
+                    'html': markup,
+                }, self.source)
+                self.assertEqual(extracted['application_methods'][0]['method'], route_method)
+                if route_method == 'phone':
+                    self.assertEqual(extracted['application_method'], 'source_only')
+                else:
+                    self.assertEqual(extracted['application_method'], route_method)
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_online_portal_and_labeled_application_form_are_distinguished(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        portal = basic_extract({
+            'title': 'Online opportunity',
+            'url': 'https://example.org/opportunities/online',
+            'text': 'Submit your application online.',
+            'html': '<a href="/portal/42" aria-label="Apply Online">Continue</a>',
+        }, self.source)
+        form = basic_extract({
+            'title': 'Form opportunity',
+            'url': 'https://example.org/opportunities/form',
+            'text': 'Complete the application form.',
+            'html': '<a href="https://forms.example.org/entry/42">Application Form</a>',
+        }, self.source)
+
+        self.assertEqual(portal['application_method'], 'online')
+        self.assertEqual(portal['application_url'], 'https://example.org/portal/42')
+        self.assertEqual(form['application_method'], 'form')
+        self.assertEqual(form['application_form_url'], 'https://forms.example.org/entry/42')
+        self.assertEqual(form['application_url'], '')
+
+    def test_general_contacts_and_ambiguous_instructions_are_not_application_routes(self):
+        from .services.source_ingestion import basic_extract
+
+        for text in (
+            'For general information, contact applications@example.org.',
+            'Applications are open. Contact the organization for further details.',
+        ):
+            with self.subTest(text=text):
+                extracted = basic_extract({
+                    'title': 'Research opportunity',
+                    'url': 'https://example.org/opportunities/1',
+                    'text': text,
+                    'html': (
+                        '<a href="mailto:applications@example.org">Contact email</a>'
+                        '<form action="/contact"><label>Contact us</label>'
+                        '<button>Send message</button></form>'
+                    ),
+                }, self.source)
+                self.assertEqual(extracted['application_method'], 'source_only')
+                self.assertEqual(extracted['application_methods'], [])
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_multiple_explicit_application_methods_are_preserved(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        extracted = basic_extract({
+            'title': 'Multi-route opportunity',
+            'url': 'https://example.org/opportunities/multi',
+            'text': (
+                'Apply online at https://apply.example.org/entry or, alternatively, '
+                'email your CV to fellowship@example.org. Applications may also be '
+                'delivered in person to 1 Research Road, Nairobi.'
+            ),
+            'html': (
+                '<a href="https://apply.example.org/entry">Apply Now</a>'
+                '<address>1 Research Road, Nairobi</address>'
+            ),
+        }, self.source)
+
+        self.assertEqual(extracted['application_method'], 'online')
+        self.assertEqual(
+            {route['method'] for route in extracted['application_methods']},
+            {'online', 'email', 'physical'},
+        )
+        self.assertIn('fellowship@example.org', extracted['application_instructions'])
 
     def test_extraction_detects_explicit_application_link_and_keeps_long_description(self):
         from .services.source_ingestion import basic_extract
@@ -384,6 +645,481 @@ class OpportunityAgentTestCase(TestCase):
             'html': '<h1>Browsing: Scholarships</h1>',
         }))
 
+    def test_listing_page_rejects_category_search_archive_and_directory_pages(self):
+        from .services.source_ingestion import is_listing_page
+
+        for heading in (
+            'Browsing: Training',
+            'Browsing: Conferences',
+            'Browsing: PhD/Postdoctoral',
+            'Search results for scholarships',
+            'Scholarship Categories',
+            'Opportunity Archive',
+            'Training Directory',
+        ):
+            with self.subTest(heading=heading):
+                self.assertTrue(is_listing_page({
+                    'title': heading,
+                    'url': 'https://example.org/opportunities',
+                    'html': f'<html><h1>{heading}</h1></html>',
+                }))
+
+    def test_specific_opportunity_titles_with_category_words_are_not_listings(self):
+        from .services.source_ingestion import is_listing_page
+
+        for title in (
+            'Fully Funded PhD Scholarship in Climate Research',
+            'Digital Skills Training Fellowship',
+            'International Conference Travel Scholarship',
+            'Research Internship and Job Training Program',
+        ):
+            with self.subTest(title=title):
+                self.assertFalse(is_listing_page({
+                    'title': title,
+                    'url': 'https://example.org/jobs/specific-opportunity',
+                    'html': f'<html><h1>{title}</h1><p>Apply by 2035.</p></html>',
+                }))
+
+    def test_structured_opportunity_detail_overrides_a_generic_category_word_title(self):
+        from .services.source_ingestion import is_listing_page
+
+        description = (
+            'The Example Institute offers this named scholarship for graduate '
+            'researchers. Applicants must submit a research proposal and meet '
+            'the eligibility requirements listed below.'
+        )
+        self.assertFalse(is_listing_page({
+            'title': 'Scholarship',
+            'url': 'https://example.org/scholarship/graduate-research',
+            'html': (
+                '<h1>Scholarship</h1><script type="application/ld+json">'
+                + json.dumps({
+                    '@type': 'Scholarship',
+                    'name': 'Scholarship',
+                    'description': description,
+                    'provider': {'name': 'Example Institute'},
+                    'applicationUrl': 'https://apply.example.org/graduate-research',
+                })
+                + '</script>'
+            ),
+        }))
+        self.assertFalse(is_listing_page({
+            'title': 'Scholarships',
+            'url': 'https://example.org/scholarship/graduate-research',
+            'html': (
+                '<h1>Graduate Research Scholarship at Example Institute</h1>'
+                '<p>Applicants can submit a research proposal through the portal.</p>'
+            ),
+        }))
+        self.assertTrue(is_listing_page({
+            'title': 'Scholarships',
+            'url': 'https://example.org/scholarships',
+            'html': (
+                '<h1>Scholarships</h1>'
+                '<script type="application/ld+json">'
+                + json.dumps({
+                    '@type': 'Scholarship',
+                    'name': 'Featured Scholarship',
+                    'description': description,
+                    'provider': {'name': 'Example Institute'},
+                    'applicationUrl': 'https://apply.example.org/featured',
+                })
+                + '</script>'
+                '<a href="/one">Research Scholarship one</a>'
+                '<a href="/two">Research Scholarship two</a>'
+                '<a href="/three">Research Scholarship three</a>'
+            ),
+        }))
+
+    def test_listing_directory_structure_and_pagination_are_detected(self):
+        from .services.source_ingestion import is_listing_page
+        from .management.commands.audit_application_routes import _listing_content_evidence
+
+        candidate = {
+            'title': 'Latest opportunities',
+            'url': 'https://example.org/category/scholarships/page/2',
+            'html': (
+                '<meta name="description" content="Browse all current opportunities">'
+                '<h1>Latest opportunities</h1>'
+                '<article class="opportunity-card"><a href="/one">PhD Scholarship</a></article>'
+                '<article class="opportunity-card"><a href="/two">Research Fellowship</a></article>'
+                '<article class="opportunity-card"><a href="/three">Training Grant</a></article>'
+            ),
+        }
+        self.assertTrue(is_listing_page(candidate))
+        evidence = _listing_content_evidence(candidate)
+        self.assertTrue(any('Latest opportunities' in item for item in evidence))
+        self.assertTrue(any('opportunity-specific links' in item for item in evidence))
+        self.assertTrue(any('repeated listing/card containers' in item for item in evidence))
+
+    def test_reliefweb_listing_filters_are_rejected_but_detail_query_is_allowed(self):
+        from .services.source_ingestion import is_listing_page, listing_url_reason
+
+        for url in (
+            'https://reliefweb.int/jobs?list=123',
+            'https://reliefweb.int/jobs?advanced-search=1',
+            'https://reliefweb.int/jobs?country=kenya&page=2',
+            'https://reliefweb.int/jobs?organization=example',
+            'https://reliefweb.int/jobs',
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(listing_url_reason(url))
+                self.assertTrue(is_listing_page({
+                    'title': 'Research Opportunity',
+                    'url': url,
+                    'html': '<h1>Research Opportunity</h1>',
+                }))
+
+        detail_url = 'https://reliefweb.int/job/1234567/research-officer?source=portal'
+        self.assertFalse(listing_url_reason(detail_url))
+        self.assertFalse(is_listing_page({
+            'title': 'Research Officer',
+            'url': detail_url,
+            'html': (
+                '<article><h1>Research Officer</h1>'
+                '<p>Manage a research program and submit an application online. '
+                'Applicants must have a relevant degree and field experience.</p></article>'
+            ),
+        }))
+
+    def test_opportunity_desk_categories_archives_and_roundups_are_rejected(self):
+        from .services.source_ingestion import is_listing_page, listing_url_reason
+
+        for url in (
+            'https://opportunitydesk.org/',
+            'https://opportunitydesk.org/category/scholarships/',
+            'https://opportunitydesk.org/2025/',
+            'https://opportunitydesk.org/?s=scholarships',
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(listing_url_reason(url))
+                self.assertTrue(is_listing_page({
+                    'title': 'Scholarship Opportunity',
+                    'url': url,
+                    'html': '<h1>Scholarship Opportunity</h1>',
+                }))
+        self.assertTrue(is_listing_page({
+            'title': 'Deadline Roundup: Opportunities Closing This Week',
+            'url': 'https://opportunitydesk.org/2025/01/deadline-roundup/',
+            'html': '<article><h1>Deadline Roundup: Opportunities Closing This Week</h1></article>',
+        }))
+        detail_url = 'https://opportunitydesk.org/2025/01/research-fellowship/'
+        self.assertFalse(listing_url_reason(detail_url))
+        self.assertFalse(is_listing_page({
+            'title': 'Research Fellowship at Example Institute',
+            'url': detail_url,
+            'html': (
+                '<article><h1>Research Fellowship at Example Institute</h1>'
+                '<div class="entry-content"><p>Applications are open for a specific '
+                'research fellowship. Applicants must submit a CV, references, and '
+                'a research statement by the stated deadline.</p></div></article>'
+            ),
+        }))
+
+    def test_unusual_source_detail_url_is_validated_by_content_not_domain(self):
+        from .services.source_ingestion import (
+            is_listing_page,
+            listing_url_reason,
+            opportunity_detail_validation_error,
+        )
+
+        detail = {
+            'title': 'Field Research Fellowship at Example Institute',
+            'url': 'https://opportunitydesk.org/fellowships/field-research-2026/?source=article',
+            'html': (
+                '<article><h1>Field Research Fellowship at Example Institute</h1>'
+                '<div class="entry-content"><p>The Example Institute invites '
+                'applications for a named 12-month field research fellowship. '
+                'Applicants must hold a relevant degree, submit a CV and research '
+                'proposal, and meet the eligibility criteria before the deadline.</p>'
+                '<a href="https://apply.example.org/field-research">Apply</a>'
+                '</div></article>'
+            ),
+        }
+
+        self.assertFalse(listing_url_reason(detail['url']))
+        self.assertFalse(is_listing_page(detail))
+        self.assertEqual(opportunity_detail_validation_error(detail), '')
+
+    def test_public_opportunity_surfaces_hide_listings_but_keep_route_missing_detail(self):
+        listing = Opportunity.objects.create(
+            source=self.source,
+            title='Research Fellowships',
+            source_url='https://opportunitydesk.org/category/research-fellowships/',
+            description='Browse recent fellowships.',
+            status='active',
+            dedupe_hash='public-listing-page',
+        )
+        manual_review = Opportunity.objects.create(
+            source=self.source,
+            title='Field Research Fellowship at Example Institute',
+            source_url='https://example.org/program/field-research-2026',
+            description=(
+                'The Example Institute offers this 12-month field research '
+                'fellowship. Applicants must hold a relevant degree and submit '
+                'a research proposal by the deadline.'
+            ),
+            status='active',
+            application_method='source_only',
+            dedupe_hash='public-genuine-detail-without-route',
+        )
+
+        home = self.client.get('/')
+        listing_page = self.client.get('/opportunities/')
+        sitemap = self.client.get('/sitemap.xml')
+
+        self.assertEqual(home.status_code, 200)
+        self.assertNotIn(listing, home.context['featured'])
+        self.assertEqual(listing_page.status_code, 200)
+        self.assertNotIn(listing, listing_page.context['opportunities'])
+        self.assertIn(manual_review, listing_page.context['opportunities'])
+        self.assertNotContains(sitemap, f'/opportunities/{listing.pk}/')
+        self.assertContains(sitemap, f'/opportunities/{manual_review.pk}/')
+        self.assertEqual(
+            self.client.get(f'/opportunities/{listing.pk}/').status_code,
+            404,
+        )
+        detail_response = self.client.get(f'/opportunities/{manual_review.pk}/')
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertContains(detail_response, manual_review.title)
+        listing.refresh_from_db()
+        self.assertEqual(listing.status, 'active')
+
+    def test_listing_opportunity_cannot_be_applied_to_or_prepared(self):
+        from .tasks import process_application_queue_task
+
+        listing = Opportunity.objects.create(
+            source=self.source,
+            title='Open positions',
+            source_url='https://reliefweb.int/jobs?list=123',
+            dedupe_hash='listing-cannot-apply-or-queue',
+        )
+        self.client.force_login(self.user)
+        response = self.client.post(f'/opportunities/{listing.pk}/apply/')
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(Application.objects.filter(
+            user=self.user,
+            opportunity=listing,
+        ).exists())
+        application = Application.objects.create(
+            user=self.user,
+            opportunity=listing,
+            status='queued',
+        )
+
+        result = process_application_queue_task.run(limit=5)
+
+        application.refresh_from_db()
+        self.assertEqual(application.status, 'needs_review')
+        self.assertIn('not publishable', application.error_message)
+        self.assertEqual(result['processed'], 0)
+
+    def test_detail_validation_requires_specific_url_and_opportunity_content(self):
+        from .services.source_ingestion import opportunity_detail_validation_error
+
+        valid_page = {
+            'title': 'Research Fellowship at Example Institute',
+            'url': 'https://opportunitydesk.org/2025/01/research-fellowship/',
+            'html': (
+                '<article><h1>Research Fellowship at Example Institute</h1>'
+                '<div class="entry-content"><p>This fellowship supports '
+                'early-career researchers at the Example Institute. Applicants '
+                'must submit a research proposal and curriculum vitae by the '
+                'deadline. Apply using the online application portal.</p>'
+                '<a href="https://apply.example.org/fellowship">Apply Now</a>'
+                '</div></article>'
+            ),
+        }
+        self.assertEqual(opportunity_detail_validation_error(valid_page), '')
+        self.assertTrue(opportunity_detail_validation_error({
+            'title': 'Research Fellowship',
+            'url': 'https://opportunitydesk.org/category/fellowships/',
+            'html': '<h1>Research Fellowship</h1>',
+        }))
+        self.assertTrue(opportunity_detail_validation_error({
+            'title': 'Research Fellowship',
+            'url': 'https://opportunitydesk.org/2025/01/research-fellowship/',
+            'html': '<article><h1>Research Fellowship</h1><p>Brief notice.</p></article>',
+        }))
+
+    def test_query_based_listing_pages_are_rejected_but_reliefweb_detail_is_content_checked(self):
+        from .services.source_ingestion import (
+            listing_url_reason,
+            opportunity_detail_validation_error,
+        )
+
+        self.assertTrue(listing_url_reason('https://example.org/opportunities?category=jobs'))
+        self.assertTrue(listing_url_reason(
+            'https://reliefweb.int/job/4233250/research-officer?list=jobs'
+        ))
+        detail = {
+            'title': 'Research Officer',
+            'url': 'https://reliefweb.int/job/4233250/research-officer?source=portal',
+            'html': (
+                '<article><h1>Research Officer</h1><div itemprop="articleBody">'
+                '<p>The organization is recruiting a Research Officer. Applicants '
+                'must submit an application with a relevant degree and experience '
+                'by the deadline. Apply through the official recruitment portal.</p>'
+                '<a href="https://apply.example.org/role">Apply online</a>'
+                '</div></article>'
+            ),
+        }
+        self.assertEqual(opportunity_detail_validation_error(detail), '')
+        detail['html'] = '<article><h1>Research Officer</h1><p>Short entry.</p></article>'
+        self.assertTrue(opportunity_detail_validation_error(detail))
+
+    def test_detail_page_content_prefers_article_body_for_supported_sources(self):
+        from .services.source_ingestion import detail_page_content
+
+        body = (
+            '<nav>Jobs Scholarships Opportunities</nav>'
+            '<article><h1>Research Fellowship</h1><div class="entry-content">'
+            '<p>Specific program description and eligibility details.</p>'
+            '</div></article>'
+        )
+        text = detail_page_content(
+            'https://opportunitydesk.org/2025/01/research-fellowship/',
+            body,
+        ).get_text(' ', strip=True)
+        self.assertIn('Specific program description', text)
+        self.assertNotIn('Jobs Scholarships Opportunities', text)
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_application_link_label_variants_and_accessible_names_are_supported(
+        self,
+        public_addresses,
+    ):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        for index, label in enumerate((
+            'Apply',
+            'Apply Now',
+            'Apply Online',
+            'Application Portal',
+            'Application Form',
+            'Submit Application',
+            'Register',
+            'Register Now',
+            'Start Application',
+        )):
+            with self.subTest(label=label):
+                extracted = basic_extract({
+                    'title': 'Research Fellowship',
+                    'url': 'https://example.org/fellowship',
+                    'source_landing_url': 'https://example.org/opportunities',
+                    'text': '',
+                    'html': (
+                        f'<a href="/apply/{index}" aria-label="{label}">'
+                        'Continue</a>'
+                    ),
+                }, self.source)
+                if label == 'Application Form':
+                    self.assertEqual(extracted['application_url'], '')
+                    self.assertEqual(
+                        extracted['application_form_url'],
+                        f'https://example.org/apply/{index}',
+                    )
+                    self.assertEqual(extracted['application_method'], 'form')
+                else:
+                    self.assertEqual(
+                        extracted['application_url'],
+                        f'https://example.org/apply/{index}',
+                    )
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_application_url_is_resolved_from_relative_detail_link(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        extracted = basic_extract({
+            'title': 'Training Fellowship',
+            'url': 'https://example.org/opportunities/training/42',
+            'source_landing_url': 'https://example.org/opportunities',
+            'text': '',
+            'html': '<a title="Apply Online" href="../apply/42">Continue</a>',
+        }, self.source)
+
+        self.assertEqual(
+            extracted['application_url'],
+            'https://example.org/opportunities/apply/42',
+        )
+
+    def test_labeled_application_form_action_is_extracted(self):
+        from .services.source_ingestion import basic_extract
+
+        extracted = basic_extract({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/fellowship',
+            'source_landing_url': 'https://example.org/opportunities',
+            'text': 'Submit Application',
+            'html': (
+                '<form action="/application/submit" name="application">'
+                '<button type="submit">Submit</button></form>'
+            ),
+        }, self.source)
+
+        self.assertEqual(
+            extracted['application_url'],
+            'https://example.org/application/submit',
+        )
+
+    @patch(
+        'opportunity_agent.services.source_ingestion.public_addresses',
+        side_effect=ValueError('URL must resolve only to public IP addresses.'),
+    )
+    def test_private_application_destinations_are_rejected(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        extracted = basic_extract({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/fellowship',
+            'text': 'Apply at http://127.0.0.1:8000/admin.',
+            'html': '<a href="http://127.0.0.1:8000/apply">Apply Now</a>',
+        }, self.source)
+
+        self.assertEqual(extracted['application_url'], '')
+        self.assertEqual(extracted['application_method'], 'source_only')
+        self.assertTrue(public_addresses.called)
+
+    def test_unsafe_schemes_and_credentialed_application_urls_are_rejected(self):
+        from .services.source_ingestion import basic_extract
+
+        for href in (
+            'javascript:alert(1)',
+            'https://user:password@example.org/apply',
+        ):
+            with self.subTest(href=href):
+                extracted = basic_extract({
+                    'title': 'Research Fellowship',
+                    'url': 'https://example.org/fellowship',
+                    'text': '',
+                    'html': f'<a href="{href}">Apply Now</a>',
+                }, self.source)
+                self.assertEqual(extracted['application_url'], '')
+
+    @patch('opportunity_agent.services.source_ingestion.public_addresses')
+    def test_application_url_and_form_are_extracted_from_json_ld(self, public_addresses):
+        from .services.source_ingestion import basic_extract
+
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+        extracted = basic_extract({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/fellowship',
+            'text': 'Research Fellowship details.',
+            'html': (
+                '<script type="application/ld+json">'
+                '{"@type":"JobPosting","applicationUrl":"https://forms.example.org/apply"}'
+                '</script>'
+            ),
+        }, self.source)
+
+        self.assertEqual(
+            extracted['application_url'],
+            'https://forms.example.org/apply',
+        )
+        self.assertEqual(extracted['application_method'], 'online')
+
     def test_generic_category_page_with_multiple_opportunity_links_is_a_listing(self):
         from .services.source_ingestion import is_listing_page
 
@@ -407,12 +1143,17 @@ class OpportunityAgentTestCase(TestCase):
                 'url': 'https://example.org/fellowship',
                 'source_landing_url': 'https://example.org/opportunities',
                 'text': '',
-                'data': {'application_url': 'https://example.org/opportunities'},
+                'data': {
+                    'application_url': 'https://example.org/opportunities',
+                    'application_form_url': 'https://example.org/opportunities',
+                },
             },
             self.source,
         )
 
         self.assertEqual(extracted['application_url'], '')
+        self.assertEqual(extracted['application_form_url'], '')
+        self.assertEqual(extracted['application_method'], 'source_only')
 
     def test_structured_detail_url_is_not_accepted_as_application_destination(self):
         from .services.source_ingestion import basic_extract
@@ -445,6 +1186,7 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(extracted['title'], 'Research Fellowship')
         self.assertEqual(extracted['application_url'], '')
         self.assertEqual(extracted['contact_email'], 'fellowships@example.org')
+        self.assertEqual(extracted['application_method'], 'email')
 
     def test_email_only_application_guard_returns_manual_contact_reason(self):
         from .services.application_guard import ApplicationGuard
@@ -455,8 +1197,17 @@ class OpportunityAgentTestCase(TestCase):
             status='prepared',
         )
         self.opportunity.application_url = ''
-        self.opportunity.contact_email = 'fellowships@example.org'
-        self.opportunity.save(update_fields=['application_url', 'contact_email'])
+        self.opportunity.contact_email = 'general@example.org'
+        self.opportunity.application_method = 'email'
+        self.opportunity.application_methods = [{
+            'method': 'email',
+            'destination': 'applications@example.org',
+            'instructions': 'Email the completed application to this address.',
+        }]
+        self.opportunity.save(update_fields=[
+            'application_url', 'contact_email', 'application_method',
+            'application_methods',
+        ])
 
         with patch.object(
             ApplicationGuard,
@@ -473,7 +1224,36 @@ class OpportunityAgentTestCase(TestCase):
 
         self.assertFalse(allowed)
         self.assertIn('MANUAL_CONTACT_REQUIRED', reason)
-        self.assertIn('fellowships@example.org', reason)
+        self.assertIn('applications@example.org', reason)
+        self.assertNotIn('general@example.org', reason)
+
+    def test_general_contact_is_not_treated_as_an_application_method(self):
+        from .services.application_guard import ApplicationGuard
+
+        application = Application.objects.create(
+            user=self.user,
+            opportunity=self.opportunity,
+            status='prepared',
+        )
+        self.opportunity.application_url = ''
+        self.opportunity.application_method = 'source_only'
+        self.opportunity.contact_email = 'info@example.org'
+        self.opportunity.save(update_fields=[
+            'application_url', 'application_method', 'contact_email',
+        ])
+
+        with patch.object(ApplicationGuard, '_cv_is_available', return_value=(True, '')):
+            allowed, reason = ApplicationGuard.can_submit(
+                self.user,
+                self.opportunity,
+                self.profile,
+                application=application,
+                adapter=Mock(),
+            )
+
+        self.assertFalse(allowed)
+        self.assertIn('APPLICATION_METHOD_UNVERIFIED', reason)
+        self.assertNotIn('info@example.org', reason)
 
     def test_structured_requirement_values_are_normalized_without_inference(self):
         from .services.source_ingestion import basic_extract
@@ -524,7 +1304,7 @@ class OpportunityAgentTestCase(TestCase):
             (
                 detail_url,
                 '<html><h1>Research Fellowship</h1><p>Full detail text and requirements.</p>'
-                '<a href="/apply/123">Application Form</a></html>',
+                '<a href="/apply/123">Apply Now</a></html>',
                 'text/html',
             ),
         ]
@@ -539,6 +1319,65 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(saved_data['source_url'], detail_url)
         self.assertEqual(upsert.call_args.args[0].url, landing_url)
         self.assertEqual(saved_data['application_url'], 'https://example.com/apply/123')
+
+    @patch('opportunity_agent.tasks._validate_public_source_url')
+    @patch('opportunity_agent.tasks.fetch_public_source')
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={
+            'application_url': 'https://invented.example/apply',
+            'application_form_url': 'https://invented.example/form.pdf',
+            'application_method': 'source_only',
+            'application_methods': [{
+                'method': 'email',
+                'destination': 'invented@example.org',
+                'instructions': 'Use the invented AI destination.',
+            }],
+            'application_instructions': 'Invented AI instructions.',
+        },
+    )
+    @patch('opportunity_agent.tasks._upsert_opportunity', return_value=(None, False))
+    def test_ai_does_not_overwrite_verified_application_destinations(
+        self,
+        upsert,
+        extract,
+        fetch,
+        validate_url,
+    ):
+        from .tasks import scan_sources_task
+
+        source = Source.objects.get(pk=self.source.pk)
+        fetch.side_effect = [
+            (
+                'https://example.com/jobs',
+                '<a href="/jobs/research-fellowship">Research Fellowship</a>',
+                'text/html',
+            ),
+            (
+                'https://example.com/jobs/research-fellowship',
+                '<h1>Research Fellowship</h1>'
+                '<p>Full fellowship details.</p>'
+                '<a href="/apply/verified">Apply Now</a>',
+                'text/html',
+            ),
+        ]
+
+        result = scan_sources_task.run(limit=1, source_ids=[source.pk])
+
+        self.assertEqual(result['successful'], 1)
+        extracted = upsert.call_args.args[1]
+        self.assertEqual(
+            extracted['application_url'],
+            'https://example.com/apply/verified',
+        )
+        self.assertEqual(extracted['application_form_url'], '')
+        self.assertEqual(extracted['application_method'], 'online')
+        self.assertEqual(
+            extracted['application_methods'][0]['destination'],
+            'https://example.com/apply/verified',
+        )
+        self.assertNotIn('invented@example.org', str(extracted['application_methods']))
+        self.assertNotIn('Invented AI instructions.', extracted['application_instructions'])
 
     @patch('opportunity_agent.tasks._validate_public_source_url')
     @patch(
@@ -648,6 +1487,389 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(upsert.call_count, 1)
         self.assertEqual(upsert.call_args.args[1]['title'], 'Valid Fellowship')
 
+    @override_settings(SOURCE_CANDIDATE_BATCH_SIZE=1)
+    @patch('opportunity_agent.tasks._validate_public_source_url')
+    @patch(
+        'opportunity_agent.tasks.fetch_public_source',
+        return_value=(
+            'https://example.com/jobs',
+            '<html><title>Research opportunities</title></html>',
+            'text/html',
+        ),
+    )
+    @patch('opportunity_agent.tasks.extract_candidates')
+    @patch('opportunity_agent.tasks.AIClient.extract_opportunity', return_value={})
+    @patch('opportunity_agent.tasks._upsert_opportunity', return_value=(None, False))
+    def test_source_scan_continues_at_the_next_candidate_batch(
+        self,
+        upsert,
+        extract,
+        candidates,
+        fetch,
+        validate_url,
+    ):
+        from .tasks import scan_sources_task
+
+        source = Source.objects.get(pk=self.source.pk)
+        items = [
+            {
+                'title': f'Research Fellowship {index}',
+                'url': f'https://example.com/jobs/{index}',
+                'source_landing_url': 'https://example.com/jobs',
+                'text': f'Research fellowship number {index}.',
+                'html': '',
+                'raw_source_content': f'Research fellowship number {index}.',
+            }
+            for index in (1, 2)
+        ]
+        candidates.side_effect = lambda *_args: iter(items)
+
+        first = scan_sources_task.run(limit=1, source_ids=[source.pk])
+        source.refresh_from_db()
+        self.assertEqual(first['successful'], 1)
+        self.assertEqual(upsert.call_count, 1)
+        self.assertEqual(source.candidate_scan_cursor, 1)
+
+        second = scan_sources_task.run(limit=1, source_ids=[source.pk])
+        source.refresh_from_db()
+        self.assertEqual(second['successful'], 1)
+        self.assertEqual(upsert.call_count, 2)
+        self.assertEqual(upsert.call_args.args[1]['title'], 'Research Fellowship 2')
+        self.assertEqual(source.candidate_scan_cursor, 0)
+
+    def test_short_legitimate_discovery_page_is_not_rejected_by_length(self):
+        from .services.source_discovery import _inspect_candidate
+
+        with patch(
+            'opportunity_agent.services.public_http.socket.getaddrinfo',
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443)),
+            ],
+        ), patch(
+            'opportunity_agent.services.source_discovery._fetch_public_page',
+            return_value=(
+                'https://example.org/jobs',
+                '<html><title>Research Jobs</title><body>Research jobs and internships.</body></html>',
+            ),
+        ):
+            result = _inspect_candidate(
+                'Research careers',
+                'https://example.org/jobs',
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['opportunity_types'], ['job', 'internship', 'research'])
+
+    def test_generic_category_heading_is_rejected_but_category_word_in_detail_url_is_not(self):
+        from .services.source_ingestion import is_listing_page
+
+        self.assertTrue(is_listing_page({
+            'title': 'Jobs',
+            'url': 'https://example.org/jobs',
+            'html': '<html><h1>Jobs</h1></html>',
+        }))
+        self.assertFalse(is_listing_page({
+            'title': 'Research Fellowship',
+            'url': 'https://example.org/jobs/research-fellowship',
+            'html': '<html><h1>Research Fellowship</h1><p>Apply now.</p></html>',
+        }))
+
+    def test_legacy_heuristic_does_not_promote_source_or_article_urls_to_application(self):
+        from .services.source_scanner import _heuristic_extract
+
+        source_url = 'https://example.org/jobs/apply/research'
+        extracted = _heuristic_extract(
+            f'Research Fellowship. Apply now: {source_url}',
+            source_url,
+        )
+
+        self.assertEqual(extracted['application_url'], '')
+
+    def test_registration_url_must_match_the_authorized_credential_domain(self):
+        from .models import EmailMailbox, SiteCredential
+        from .services.account_registration import register_site_account
+
+        mailbox = EmailMailbox.objects.create(
+            user=self.user,
+            name='Primary mailbox',
+            email='alice@example.com',
+        )
+        credential = SiteCredential.objects.create(
+            user=self.user,
+            name='Trusted site',
+            domain='trusted.example',
+            registration_url='https://attacker.example/register',
+            auto_register=True,
+            email_mailbox=mailbox,
+        )
+
+        succeeded, reason = register_site_account(credential)
+
+        self.assertFalse(succeeded)
+        self.assertIn('authorized credential domain', reason)
+
+    @patch('opportunity_agent.services.public_http.socket.getaddrinfo')
+    def test_registration_destination_requires_authorized_public_https_host(self, getaddrinfo):
+        from .services.account_registration import _authorized_registration_url
+
+        getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443)),
+        ]
+        self.assertTrue(_authorized_registration_url(
+            'https://forms.trusted.example/register',
+            'trusted.example',
+        ))
+        self.assertFalse(_authorized_registration_url(
+            'https://attacker.example/register',
+            'trusted.example',
+        ))
+        self.assertFalse(_authorized_registration_url(
+            'http://trusted.example/register',
+            'trusted.example',
+        ))
+        getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 443)),
+        ]
+        self.assertFalse(_authorized_registration_url(
+            'https://trusted.example/register',
+            'trusted.example',
+        ))
+
+    def test_registration_error_redacts_passwords_and_url_tokens(self):
+        from .services.account_registration import _safe_registration_error
+
+        error = _safe_registration_error(
+            'Password=site-password while visiting https://example.org/?token=mail-token',
+            ('site-password', 'mail-token'),
+        )
+
+        self.assertNotIn('site-password', error)
+        self.assertNotIn('mail-token', error)
+        self.assertIn('[redacted]', error)
+
+    def test_public_http_rejects_mixed_public_and_private_dns_answers(self):
+        from .services.public_http import public_addresses
+
+        with patch(
+            'opportunity_agent.services.public_http.socket.getaddrinfo',
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 443)),
+            ],
+        ):
+            with self.assertRaises(ValueError):
+                public_addresses('https://example.org')
+
+    def test_public_http_rejects_actual_connection_to_unapproved_address(self):
+        from .services.public_http import validate_response_peer
+
+        class FakeSocket(socket.socket):
+            def getpeername(self):
+                return ('127.0.0.1', 443)
+
+        peer_socket = FakeSocket()
+        try:
+            response = requests.Response()
+            response.raw = SimpleNamespace(
+                _connection=SimpleNamespace(sock=peer_socket),
+            )
+            with self.assertRaises(ValueError):
+                validate_response_peer(
+                    response,
+                    {ipaddress.ip_address('93.184.216.34')},
+                )
+        finally:
+            peer_socket.close()
+
+    @patch('opportunity_agent.services.public_http.public_addresses')
+    @patch('opportunity_agent.services.public_http.requests.get')
+    def test_public_http_does_not_follow_redirects(self, get, public_addresses):
+        from .services.public_http import get_public_response
+
+        response = Mock()
+        response.status_code = 302
+        get.return_value = response
+        public_addresses.return_value = {ipaddress.ip_address('93.184.216.34')}
+
+        with self.assertRaises(ValueError):
+            get_public_response('https://example.org/path', timeout=7)
+
+        get.assert_called_once_with(
+            'https://example.org/path',
+            headers=None,
+            timeout=7,
+            params=None,
+            allow_redirects=False,
+            stream=True,
+        )
+        response.close.assert_called_once()
+
+    @patch('opportunity_agent.services.document_forms.get_public_response')
+    def test_application_form_download_uses_safe_public_http(self, get_response):
+        from .services.document_forms import download_form
+
+        response = Mock()
+        response.content = b'form data'
+        response.headers = {'content-type': 'application/pdf'}
+        get_response.return_value = response
+
+        content, content_type = download_form('https://forms.example.org/form.pdf')
+
+        self.assertEqual(content, b'form data')
+        self.assertEqual(content_type, 'application/pdf')
+        get_response.assert_called_once_with(
+            'https://forms.example.org/form.pdf',
+            timeout=30,
+            headers={'User-Agent': 'OpportunityAgent/1.0'},
+        )
+        response.close.assert_called_once()
+
+    @override_settings(DISCOVERY_MAX_PER_CYCLE=3, DISCOVERY_PAGE_SIZE=1)
+    @patch(
+        'opportunity_agent.services.source_discovery.PUBLIC_SOURCE_CANDIDATES',
+        [],
+    )
+    @patch('opportunity_agent.services.source_discovery.get_public_response')
+    def test_discovery_continues_to_next_query_after_query_failure(
+        self,
+        get_response,
+    ):
+        from .services.source_discovery import discover_public_sources
+
+        response = Mock()
+        response.text = '<html></html>'
+        response.close.return_value = None
+        get_response.side_effect = [requests.ConnectionError('temporary'), response]
+
+        discover_public_sources([
+            'jobs', 'careers', 'vacancies', 'scholarships', 'internships',
+        ])
+
+        self.assertEqual(get_response.call_count, 2)
+        self.assertEqual(
+            get_response.call_args_list[1].kwargs['params']['q'],
+            '"scholarships" OR "internships"',
+        )
+
+    def test_deduplication_preserves_content_longer_than_previous_cap(self):
+        from .services.deduplication import deduplicate_and_save_opportunity
+
+        content = (
+            'Long opportunity requirements. '
+            + ('eligibility detail. ' * 4000)
+        ).rstrip()
+        opportunity, created = deduplicate_and_save_opportunity(
+            self.source,
+            {
+                'title': 'Long Content Preservation Regression',
+                'description': content,
+                'source_url': 'https://example.org/long-opportunity',
+            },
+            raw_content=content,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(opportunity.description, content)
+        self.assertEqual(opportunity.raw_source_content, content)
+
+    @patch.dict('os.environ', {'SMTP_PASSWORD': 'smtp-secret-123'}, clear=False)
+    def test_application_errors_redact_configured_credentials(self):
+        from .tasks import _safe_error_text
+
+        error = _safe_error_text('SMTP failed using smtp-secret-123')
+
+        self.assertNotIn('smtp-secret-123', error)
+        self.assertIn('[redacted]', error)
+
+    @patch('opportunity_agent.tasks._validate_public_source_url')
+    @patch(
+        'opportunity_agent.tasks.fetch_public_source',
+        return_value=(
+            'https://listing.example.net/jobs',
+            '<html><title>Jobs</title><body>Browse all open jobs.</body></html>',
+            'text/html',
+        ),
+    )
+    @patch('opportunity_agent.tasks._upsert_opportunity')
+    def test_listing_detection_applies_to_non_generic_source_types(
+        self,
+        upsert,
+        fetch,
+        validate_url,
+    ):
+        from .tasks import scan_sources_task
+
+        source = Source.objects.create(
+            name='Careers',
+            url='https://listing.example.net/jobs',
+            source_type='job_site',
+            scan_frequency='manual',
+        )
+
+        result = scan_sources_task.run(limit=1, source_ids=[source.pk])
+
+        self.assertEqual(result['successful'], 1)
+        upsert.assert_not_called()
+
+    def test_labeled_application_asset_is_not_accepted_as_application_url(self):
+        from .services.source_ingestion import basic_extract
+
+        extracted = basic_extract(
+            {
+                'title': 'Research Fellowship',
+                'url': 'https://example.org/research-fellowship',
+                'source_landing_url': 'https://example.org/jobs',
+                'text': 'Research Fellowship details.',
+                'html': (
+                    '<a href="https://example.org/files/apply.png">Apply Now</a>'
+                    '<a href="https://example.org/files/application.pdf">Application Form</a>'
+                ),
+            },
+            self.source,
+        )
+
+        self.assertEqual(extracted['application_url'], '')
+        self.assertEqual(
+            extracted['application_form_url'],
+            'https://example.org/files/application.pdf',
+        )
+        self.assertEqual(extracted['application_method'], 'form')
+
+    def test_telegram_contact_link_is_not_promoted_to_application_url(self):
+        from .services.source_ingestion import basic_extract
+
+        extracted = basic_extract(
+            {
+                'title': 'Research Fellowship',
+                'url': 'https://example.org/research',
+                'source_landing_url': 'https://example.org/jobs',
+                'text': 'Apply Now',
+                'html': '<a href="https://t.me/example_jobs">Apply Now</a>',
+            },
+            self.source,
+        )
+
+        self.assertEqual(extracted['application_url'], '')
+        self.assertEqual(extracted['telegram_contact'], 'https://t.me/example_jobs')
+
+    def test_telegram_labeled_plain_text_application_link_is_detected(self):
+        from .services.source_ingestion import basic_extract
+
+        extracted = basic_extract(
+            {
+                'title': 'Training Fellowship',
+                'url': 'https://t.me/channel/123',
+                'text': 'Training Fellowship. Apply now: https://forms.example.org/submit.',
+                'html': '',
+            },
+            self.source,
+        )
+
+        self.assertEqual(
+            extracted['application_url'],
+            'https://forms.example.org/submit',
+        )
+
     def test_heuristic_source_extraction_does_not_treat_source_url_as_contact_website(self):
         from .services.source_scanner import _heuristic_extract
 
@@ -739,6 +1961,645 @@ class OpportunityAgentTestCase(TestCase):
             'https://example.org/jobs/42',
         )
 
+    def test_duplicate_is_enriched_with_later_verified_application_url(self):
+        first, created = deduplicate_and_save_opportunity(
+            self.source,
+            {
+                'title': 'Research Training Fellowship',
+                'organization': 'Example Institute',
+                'description': 'A research training fellowship for graduates.',
+                'source_url': 'https://example.org/opportunities/fellowship-42',
+                'application_method': 'source_only',
+            },
+        )
+        duplicate, duplicate_created = deduplicate_and_save_opportunity(
+            self.source,
+            {
+                'title': 'Research Training Fellowship',
+                'organization': 'Example Institute',
+                'description': 'A research training fellowship for graduates.',
+                'source_url': 'https://example.org/opportunities/fellowship-42',
+                'application_url': 'https://apply.example.org/fellowship-42',
+                'application_method': 'online',
+            },
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(duplicate_created)
+        self.assertEqual(duplicate.pk, first.pk)
+        self.assertEqual(
+            duplicate.application_url,
+            'https://apply.example.org/fellowship-42',
+        )
+        self.assertEqual(duplicate.application_method, 'online')
+
+    def test_unique_hash_race_merges_the_exact_matching_record(self):
+        from .services import deduplication
+
+        existing, _ = deduplication.deduplicate_and_save_opportunity(
+            self.source,
+            {
+                'title': 'Race-safe Research Fellowship',
+                'organization': 'Example Institute',
+                'description': 'Research fellowship for graduates.',
+                'source_url': 'https://example.org/race-safe-fellowship',
+            },
+        )
+        existing.dedupe_hash = compute_dedupe_hash(
+            'Race-safe Research Fellowship',
+            'Example Institute',
+            'https://apply.example.org/race-safe',
+            None,
+        )
+        existing.save(update_fields=['dedupe_hash'])
+        incoming = {
+            'title': 'Race-safe Research Fellowship',
+            'organization': 'Example Institute',
+            'description': 'Research fellowship for graduates.',
+            'source_url': 'https://example.org/race-safe-fellowship',
+            'application_url': 'https://apply.example.org/race-safe',
+            'application_method': 'online',
+        }
+        with (
+            patch('opportunity_agent.services.deduplication.find_duplicate', return_value=None),
+            patch.object(Opportunity.objects, 'get_or_create', side_effect=IntegrityError),
+        ):
+            result, created = deduplication.deduplicate_and_save_opportunity(
+                self.source,
+                incoming,
+            )
+
+        self.assertFalse(created)
+        self.assertEqual(result.pk, existing.pk)
+        self.assertEqual(result.application_url, 'https://apply.example.org/race-safe')
+        self.assertEqual(
+            Opportunity.objects.filter(
+                dedupe_hash=existing.dedupe_hash,
+            ).count(),
+            1,
+        )
+
+    @patch('opportunity_agent.tasks._validate_public_source_url')
+    @patch('opportunity_agent.tasks.fetch_public_source')
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        side_effect=AIProviderError('All configured AI providers failed (google): HTTP 503'),
+    )
+    @patch('opportunity_agent.tasks._upsert_opportunity', return_value=(None, False))
+    def test_source_scan_keeps_explicit_extraction_when_ai_is_unavailable(
+        self,
+        upsert,
+        extract,
+        fetch,
+        validate_url,
+    ):
+        from .tasks import scan_sources_task
+
+        source = Source.objects.get(pk=self.source.pk)
+        fetch.side_effect = [
+            (
+                'https://example.com/jobs',
+                '<a href="/jobs/research-fellowship">Research Fellowship</a>',
+                'text/html',
+            ),
+            (
+                'https://example.com/jobs/research-fellowship',
+                '<article><h1>Research Fellowship</h1><p>'
+                'A specific research fellowship for graduates. Applicants must '
+                'submit a CV and research statement.</p>'
+                '<a href="/apply/fellowship">Apply Now</a></article>',
+                'text/html',
+            ),
+        ]
+
+        result = scan_sources_task.run(limit=1, source_ids=[source.pk])
+
+        self.assertEqual(result['successful'], 1)
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(
+            upsert.call_args.args[1]['application_url'],
+            'https://example.com/apply/fellowship',
+        )
+        self.assertEqual(
+            upsert.call_args.args[1]['application_methods'][0]['method'],
+            'online',
+        )
+        self.assertEqual(upsert.call_args.args[1]['application_method'], 'online')
+
+    def test_listing_review_command_defaults_to_dry_run_and_requires_backup_to_apply(self):
+        import tempfile
+        from pathlib import Path
+
+        listing = Opportunity.objects.create(
+            title='Research Scholarships',
+            source_url='https://reliefweb.int/jobs?list=123',
+            dedupe_hash='listing-review-command-test',
+        )
+        dry_run_output = StringIO()
+        call_command('review_listing_opportunities', stdout=dry_run_output)
+        listing.refresh_from_db()
+        self.assertEqual(listing.status, 'active')
+        self.assertIn('Dry-run only', dry_run_output.getvalue())
+        with self.assertRaises(CommandError):
+            call_command(
+                'review_listing_opportunities',
+                apply=True,
+                stdout=StringIO(),
+            )
+        listing.refresh_from_db()
+        self.assertEqual(listing.status, 'active')
+
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / 'listing-backup.json'
+            call_command(
+                'review_listing_opportunities',
+                apply=True,
+                confirm='MARK LISTING OPPORTUNITIES FOR REVIEW',
+                backup_file=str(backup),
+                stdout=StringIO(),
+            )
+            listing.refresh_from_db()
+            self.assertEqual(listing.status, 'needs_review')
+            self.assertTrue(backup.is_file())
+            self.assertIn('listing-review-command-test', backup.read_text(encoding='utf-8'))
+
+    def test_application_route_audit_dry_run_does_not_change_opportunity(self):
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Research Fellowship',
+            source_url='https://example.org/fellowship',
+            dedupe_hash='application-audit-dry-run-test',
+        )
+        body = (
+            '<article><h1>Research Fellowship</h1><p>This research fellowship '
+            'supports graduate researchers. Applicants must submit a CV and '
+            'research statement before the application deadline.</p>'
+            '<a href="https://apply.example.org/fellowship">Apply Now</a>'
+            '<p>To apply by email, send your application to '
+            'fellowships@example.org.</p></article>'
+        )
+        with patch(
+            'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        ), patch(
+            'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+            return_value=(opportunity.source_url, body, 'text/html'),
+        ) as fetch, CaptureQueriesContext(connection) as queries:
+            output = StringIO()
+            call_command('audit_application_routes', stdout=output)
+
+        writes = [
+            query['sql'] for query in queries
+            if query['sql'].lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'REPLACE'))
+        ]
+        self.assertEqual(writes, [])
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.application_method, 'source_only')
+        self.assertEqual(opportunity.application_url, '')
+        self.assertEqual(opportunity.application_methods, [])
+        self.assertEqual(opportunity.application_instructions, '')
+        self.assertEqual(opportunity.status, 'active')
+        self.assertEqual(opportunity.source_url, 'https://example.org/fellowship')
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn('records checked=', output.getvalue())
+        self.assertIn('Dry-run only; no database records were changed.', output.getvalue())
+        self.assertIn('online:', output.getvalue())
+        self.assertIn('email:', output.getvalue())
+
+    def test_application_route_review_report_is_read_only_repeatable_and_preserves_saved_routes(self):
+        import csv
+        import tempfile
+        from pathlib import Path
+
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Research Fellowship',
+            source_url='https://example.org/research-fellowship',
+            application_method='online',
+            application_url='https://verified.example.org/current',
+            application_form_url='https://verified.example.org/form',
+            dedupe_hash='application-route-read-only-report',
+        )
+        body = (
+            '<article><h1>Research Fellowship at Example Institute</h1>'
+            '<p>This named research fellowship supports graduate researchers. '
+            'Applicants must submit a CV and research statement before the '
+            'application deadline.</p>'
+            '<a href="https://new.example.org/apply">Apply Now</a></article>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / 'report-first.csv'
+            second_path = Path(directory) / 'report-second.csv'
+            with patch(
+                'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+                return_value={ipaddress.ip_address('93.184.216.34')},
+            ), patch(
+                'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+                return_value=(opportunity.source_url, body, 'text/html'),
+            ), CaptureQueriesContext(connection) as queries:
+                first_output = StringIO()
+                call_command(
+                    'audit_application_routes',
+                    report_csv=str(first_path),
+                    stdout=first_output,
+                )
+                second_output = StringIO()
+                call_command(
+                    'audit_application_routes',
+                    report_csv=str(second_path),
+                    stdout=second_output,
+                )
+
+            writes = [
+                query['sql'] for query in queries
+                if query['sql'].lstrip().upper().startswith(
+                    ('INSERT', 'UPDATE', 'DELETE', 'REPLACE')
+                )
+            ]
+            self.assertEqual(writes, [])
+            self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+            opportunity.refresh_from_db()
+            self.assertEqual(opportunity.application_url, 'https://verified.example.org/current')
+            self.assertEqual(opportunity.application_form_url, 'https://verified.example.org/form')
+            self.assertEqual(opportunity.application_method, 'online')
+            with first_path.open(encoding='utf-8', newline='') as stream:
+                row = next(
+                    row for row in csv.DictReader(stream)
+                    if row['opportunity_id'] == str(opportunity.pk)
+                )
+            self.assertEqual(row['classification'], 'verified current route')
+            self.assertEqual(
+                row['current_application_url'],
+                row['proposed_application_url'],
+            )
+            self.assertEqual(
+                row['current_application_form_url'],
+                row['proposed_application_form_url'],
+            )
+            self.assertIn('https://new.example.org/apply', row['proposed_application_methods'])
+            self.assertIn('Apply Now', row['evidence'])
+            self.assertEqual(
+                row['destination_check'],
+                'Not independently checked; source evidence only.',
+            )
+            self.assertIn('Read-only CSV report written', first_output.getvalue())
+
+    def test_application_route_review_report_marks_historical_route_as_expired_candidate(self):
+        import csv
+        import tempfile
+        from datetime import datetime, timezone as datetime_timezone
+        from pathlib import Path
+
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='OD Impact Challenge 2025',
+            source_url='https://opportunitydesk.org/odic/',
+            status='inactive',
+            application_method='online',
+            application_url='https://opd.to/ODIC2025apply',
+            deadline=datetime(2025, 12, 8, tzinfo=datetime_timezone.utc),
+            dedupe_hash='historical-odic-application-route',
+        )
+        body = (
+            '<article><h1>OD Impact Challenge 2025</h1>'
+            '<p>The ODIC 2025 challenge accepted applications until December 8, 2025. '
+            'Applicants submitted an entry through the 2025 application portal.</p>'
+            '<a href="https://opd.to/ODIC2025apply">Apply for ODIC 2025</a></article>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / 'historical-report.csv'
+            with patch(
+                'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+                return_value={ipaddress.ip_address('93.184.216.34')},
+            ), patch(
+                'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+                return_value=(opportunity.source_url, body, 'text/html'),
+            ):
+                call_command(
+                    'audit_application_routes',
+                    report_csv=str(report),
+                    stdout=StringIO(),
+                )
+
+            with report.open(encoding='utf-8', newline='') as stream:
+                row = next(
+                    row for row in csv.DictReader(stream)
+                    if row['opportunity_id'] == str(opportunity.pk)
+                )
+
+        self.assertEqual(row['classification'], 'potentially expired route')
+        self.assertEqual(row['current_status'], 'inactive')
+        self.assertEqual(row['proposed_status'], 'needs_review')
+        self.assertEqual(row['current_application_url'], 'https://opd.to/ODIC2025apply')
+        self.assertEqual(row['proposed_application_url'], row['current_application_url'])
+        self.assertNotIn('ODIC2025apply', row['proposed_application_methods'])
+        self.assertIn('2025', row['evidence'])
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.application_url, 'https://opd.to/ODIC2025apply')
+        self.assertEqual(opportunity.status, 'inactive')
+
+    def test_application_route_audit_keeps_genuine_detail_without_verified_route_active(self):
+        import csv
+        import tempfile
+        from pathlib import Path
+
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Research Fellowship at Example Institute',
+            source_url='https://example.org/research-fellowship',
+            application_method='source_only',
+            application_url='https://example.org/saved-application-route',
+            dedupe_hash='detail-without-verified-application-route',
+        )
+        body = (
+            '<article><h1>Research Fellowship at Example Institute</h1>'
+            '<p>This named research fellowship supports graduate researchers. '
+            'Eligibility requirements include a relevant degree and research '
+            'experience. The fellowship provides a stipend.</p></article>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / 'detail-without-route.csv'
+            with patch(
+                'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+                return_value={ipaddress.ip_address('93.184.216.34')},
+            ), patch(
+                'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+                return_value=(opportunity.source_url, body, 'text/html'),
+            ):
+                call_command(
+                    'audit_application_routes',
+                    report_csv=str(report),
+                    stdout=StringIO(),
+                )
+
+            with report.open(encoding='utf-8', newline='') as stream:
+                row = next(
+                    row for row in csv.DictReader(stream)
+                    if row['opportunity_id'] == str(opportunity.pk)
+                )
+
+        self.assertEqual(row['classification'], 'genuine detail; no route verified')
+        self.assertEqual(row['proposed_fields'], '')
+        self.assertEqual(row['proposed_status'], 'active')
+        self.assertEqual(
+            row['proposed_application_url'],
+            'https://example.org/saved-application-route',
+        )
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.status, 'active')
+        self.assertEqual(
+            opportunity.application_url,
+            'https://example.org/saved-application-route',
+        )
+
+    def test_https_route_probe_safely_follows_public_https_redirects(self):
+        from opportunity_agent.management.commands.audit_application_routes import _https_check
+
+        first = Mock(status_code=302, headers={'Location': 'https://apply.example.org/final'})
+        second = Mock(status_code=200, headers={})
+        with patch(
+            'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        ), patch(
+            'opportunity_agent.management.commands.audit_application_routes.requests.get',
+            side_effect=[first, second],
+        ) as get, patch(
+            'opportunity_agent.management.commands.audit_application_routes.validate_response_peer',
+        ) as validate_peer:
+            result = _https_check('http://apply.example.org/start?ref=role')
+
+        self.assertIn('https://apply.example.org/final', result)
+        self.assertIn('HTTP 200', result)
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs['allow_redirects'] is False
+            for call in get.call_args_list
+        ))
+        self.assertEqual(validate_peer.call_count, 2)
+
+    def test_application_route_audit_apply_updates_only_verified_route_fields(self):
+        import tempfile
+        from pathlib import Path
+
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Research Fellowship',
+            source_url='https://example.org/fellowship',
+            dedupe_hash='application-audit-apply-test',
+        )
+        body = (
+            '<article><h1>Research Fellowship</h1><p>This research fellowship '
+            'supports graduate researchers. Applicants must submit a CV and '
+            'research statement before the application deadline.</p>'
+            '<a href="https://apply.example.org/fellowship">Apply Now</a>'
+            '</article>'
+        )
+        fetch_patch = patch(
+            'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+            return_value=(opportunity.source_url, body, 'text/html'),
+        )
+        address_patch = patch(
+            'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        )
+        fetch_patch.start()
+        address_patch.start()
+        self.addCleanup(fetch_patch.stop)
+        self.addCleanup(address_patch.stop)
+
+        with self.assertRaises(CommandError):
+            call_command(
+                'audit_application_routes',
+                apply=True,
+                stdout=StringIO(),
+            )
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.application_method, 'source_only')
+
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / 'route-audit-backup.json'
+            call_command(
+                'audit_application_routes',
+                apply=True,
+                backup_file=str(backup),
+                confirm='APPLY VERIFIED ROUTE REPAIRS',
+                stdout=StringIO(),
+            )
+            opportunity.refresh_from_db()
+            self.assertEqual(opportunity.application_method, 'online')
+            self.assertEqual(
+                opportunity.application_url,
+                'https://apply.example.org/fellowship',
+            )
+            self.assertTrue(opportunity.application_methods)
+            self.assertIn('Apply Now', opportunity.application_instructions)
+            self.assertEqual(opportunity.source_url, 'https://example.org/fellowship')
+            self.assertEqual(opportunity.title, 'Research Fellowship')
+            self.assertTrue(backup.is_file())
+            self.assertIn(str(opportunity.pk), backup.read_text(encoding='utf-8'))
+            first_routes = list(opportunity.application_methods)
+            first_instructions = opportunity.application_instructions
+            call_command(
+                'audit_application_routes',
+                apply=True,
+                backup_file=str(Path(directory) / 'route-audit-rerun-backup.json'),
+                confirm='APPLY VERIFIED ROUTE REPAIRS',
+                stdout=StringIO(),
+            )
+            opportunity.refresh_from_db()
+            self.assertEqual(opportunity.application_methods, first_routes)
+            self.assertEqual(opportunity.application_instructions, first_instructions)
+
+    def test_application_route_audit_preserves_existing_verified_data(self):
+        import tempfile
+        from pathlib import Path
+
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        existing_route = {
+            'method': 'email',
+            'destination': 'verified@example.org',
+            'instructions': 'Previously verified application email.',
+        }
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Research Fellowship',
+            source_url='https://example.org/fellowship',
+            application_method='online',
+            application_url='https://verified.example.org/apply',
+            application_methods=[existing_route],
+            application_instructions='Previously verified application email.',
+            dedupe_hash='application-audit-preserve-test',
+        )
+        body = (
+            '<article><h1>Research Fellowship</h1><p>This research fellowship '
+            'supports graduate researchers. Applicants must submit a CV and '
+            'research statement before the application deadline.</p>'
+            '<a href="https://new.example.org/apply">Apply Now</a></article>'
+        )
+        with patch(
+            'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        ), patch(
+            'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+            return_value=(opportunity.source_url, body, 'text/html'),
+        ), tempfile.TemporaryDirectory() as directory:
+            call_command(
+                'audit_application_routes',
+                apply=True,
+                backup_file=str(Path(directory) / 'preserve-backup.json'),
+                confirm='APPLY VERIFIED ROUTE REPAIRS',
+                stdout=StringIO(),
+            )
+
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.application_method, 'online')
+        self.assertEqual(
+            opportunity.application_url,
+            'https://verified.example.org/apply',
+        )
+        self.assertIn(existing_route, opportunity.application_methods)
+        self.assertTrue(any(
+            route.get('destination') == 'https://new.example.org/apply'
+            for route in opportunity.application_methods
+        ))
+        self.assertIn(
+            'Previously verified application email.',
+            opportunity.application_instructions,
+        )
+
+    def test_application_route_audit_reports_unreachable_pages_without_changes(self):
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Unreachable Fellowship',
+            source_url='https://unreachable.example.org/fellowship',
+            dedupe_hash='application-audit-unreachable-test',
+        )
+        missing = Opportunity.objects.create(
+            source=self.source,
+            title='Missing Source Fellowship',
+            dedupe_hash='application-audit-missing-source-test',
+        )
+        with patch(
+            'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        ), patch(
+            'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+            side_effect=requests.ConnectionError('source unavailable'),
+        ):
+            output = StringIO()
+            call_command('audit_application_routes', stdout=output)
+
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.application_method, 'source_only')
+        self.assertEqual(opportunity.application_methods, [])
+        self.assertEqual(opportunity.status, 'active')
+        missing.refresh_from_db()
+        self.assertEqual(missing.application_method, 'source_only')
+        self.assertEqual(missing.status, 'active')
+        self.assertIn('manual review', output.getvalue())
+        self.assertIn('errors=2', output.getvalue())
+
+    def test_application_route_audit_flags_phone_only_instructions_for_review(self):
+        Opportunity.objects.filter(pk=self.opportunity.pk).update(
+            source_url='https://reliefweb.int/jobs?list=123',
+            status='needs_review',
+        )
+        opportunity = Opportunity.objects.create(
+            source=self.source,
+            title='Phone Application Fellowship',
+            source_url='https://example.org/phone-fellowship',
+            dedupe_hash='application-audit-phone-only-test',
+        )
+        body = (
+            '<article><h1>Phone Application Fellowship</h1><p>This fellowship '
+            'is available to experienced researchers. To apply by phone, call '
+            '+1 212 555 1234 before the application deadline. Applicants should '
+            'prepare a CV and research statement.</p>'
+            '<a href="tel:+12125551234">Application phone</a></article>'
+        )
+        with patch(
+            'opportunity_agent.management.commands.audit_application_routes.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        ), patch(
+            'opportunity_agent.management.commands.audit_application_routes.fetch_public_source',
+            return_value=(opportunity.source_url, body, 'text/html'),
+        ):
+            output = StringIO()
+            call_command('audit_application_routes', stdout=output)
+
+        opportunity.refresh_from_db()
+        self.assertEqual(opportunity.status, 'active')
+        self.assertEqual(opportunity.application_method, 'source_only')
+        self.assertIn('phone-only application instructions', output.getvalue().lower())
+        self.assertIn('phone:', output.getvalue())
+
     def test_rss_scanner_uses_shared_duplicate_detector(self):
         from .services.source_scanner import _save_opportunity
 
@@ -825,6 +2686,153 @@ class OpportunityAgentTestCase(TestCase):
             'visa_sponsorship': True,
         })
         self.assertGreaterEqual(result['score'], 75)
+
+    def test_five_profiles_receive_independent_career_interest_matches(self):
+        profiles = {
+            'management': {
+                'skills': ['management', 'project coordination'],
+                'preferred_opportunity_types': ['job'],
+            },
+            'software': {
+                'skills': ['Python', 'software development'],
+                'preferred_opportunity_types': ['job'],
+            },
+            'scholarship': {
+                'skills': ['student', 'scholarship'],
+                'preferred_opportunity_types': ['scholarship', 'internship'],
+            },
+            'internship': {
+                'skills': ['web development', 'internship'],
+                'preferred_opportunity_types': ['internship'],
+            },
+            'finance': {
+                'skills': ['finance', 'accounting'],
+                'preferred_opportunity_types': ['job'],
+            },
+        }
+        users = {}
+        for interest, values in profiles.items():
+            user = User.objects.create_user(
+                username=f'match-{interest}',
+                email=f'match-{interest}@example.com',
+                password='StrongPass123!',
+            )
+            profile = UserProfile.objects.create(
+                user=user,
+                current_country='Ethiopia',
+                worldwide_preference=True,
+                minimum_ai_match_score=0,
+                **values,
+            )
+            users[interest] = (user, profile)
+
+        opportunities = {
+            'management': Opportunity.objects.create(
+                title='Project Coordinator',
+                opportunity_type='job',
+                description='Coordinate project operations and provide administrative leadership.',
+                dedupe_hash='career-match-management',
+            ),
+            'software': Opportunity.objects.create(
+                title='Python Software Developer',
+                opportunity_type='job',
+                description='Build web software with Python and Django.',
+                dedupe_hash='career-match-software',
+            ),
+            'scholarship': Opportunity.objects.create(
+                title='Graduate Research Scholarship',
+                opportunity_type='scholarship',
+                description='University scholarship supporting graduate research students.',
+                dedupe_hash='career-match-scholarship',
+            ),
+            'internship': Opportunity.objects.create(
+                title='Web Development Internship',
+                opportunity_type='internship',
+                description='Internship building web applications with Python.',
+                dedupe_hash='career-match-internship',
+            ),
+            'finance': Opportunity.objects.create(
+                title='Finance and Accounting Officer',
+                opportunity_type='job',
+                description='Financial accounting, audit, and budget reporting.',
+                dedupe_hash='career-match-finance',
+            ),
+        }
+        results_by_user = {}
+        for interest, (user, profile) in users.items():
+            match_map = refresh_user_matches(profile, opportunities.values())
+            results_by_user[interest] = {
+                label: match_map[opportunity.pk].score
+                for label, opportunity in opportunities.items()
+            }
+            self.assertEqual(
+                Match.objects.filter(user=user).count(),
+                len(opportunities),
+            )
+
+        for interest in profiles:
+            self.assertGreater(
+                results_by_user[interest][interest],
+                max(
+                    score
+                    for label, score in results_by_user[interest].items()
+                    if label != interest
+                ),
+                msg=f'{interest} profile should rank its matching opportunity highest',
+            )
+        self.assertEqual(
+            Match.objects.filter(
+                user=users['software'][0],
+                opportunity=opportunities['internship'],
+            ).count(),
+            1,
+            'A relevant opportunity can be shared by overlapping profiles.',
+        )
+        other_user_match = Match.objects.get(
+            user=users['finance'][0],
+            opportunity=opportunities['finance'],
+        )
+        original_other_score = other_user_match.score
+        management_profile = users['management'][1]
+        management_profile.skills = ['finance', 'accounting']
+        management_profile.save(update_fields=['skills'])
+        refreshed = refresh_user_matches(management_profile, opportunities.values())
+        self.assertGreater(
+            refreshed[opportunities['finance'].pk].score,
+            refreshed[opportunities['management'].pk].score,
+        )
+        other_user_match.refresh_from_db()
+        self.assertEqual(other_user_match.score, original_other_score)
+
+    def test_collected_opportunity_is_matched_for_existing_active_profiles(self):
+        from .tasks import _process_telegram_candidate
+
+        self.profile.minimum_ai_match_score = 0
+        self.profile.save(update_fields=['minimum_ai_match_score'])
+        candidate = {
+            'title': 'Python Software Development Internship',
+            'url': 'https://example.org/python-internship',
+            'source_landing_url': self.source.url,
+            'text': (
+                'Python software development internship for web applications. '
+                'Applicants should have programming experience.'
+            ),
+            'html': '',
+        }
+
+        opportunity, created = _process_telegram_candidate(
+            self.source,
+            candidate,
+            Mock(extract_opportunity=Mock(return_value={})),
+        )
+
+        self.assertTrue(created)
+        self.assertTrue(
+            Match.objects.filter(
+                user=self.user,
+                opportunity=opportunity,
+            ).exists(),
+        )
 
     def test_matching_respects_selected_work_modes(self):
         profile = {
@@ -942,6 +2950,79 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(result['eligibility_status'], 'requirements_unconfirmed')
         self.assertEqual(result['requirements_status'], 'unconfirmed')
         self.assertEqual(result['recommended_action'], 'review')
+
+    def test_unrecognized_explicit_requirement_requires_review(self):
+        result = compute_match_score(
+            {
+                'current_country': 'Ethiopia',
+                'worldwide_preference': True,
+                'minimum_ai_match_score': 0,
+            },
+            {
+                'requirements': (
+                    'Applicants need to hold a current professional license.'
+                ),
+            },
+        )
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['eligibility_status'], 'requirements_unconfirmed')
+        self.assertEqual(result['recommended_action'], 'review')
+
+    def test_structured_education_requirement_conflict_blocks_eligibility(self):
+        result = compute_match_score(
+            {
+                'degree': 'BSc',
+                'education': 'Bachelor of Biology',
+                'skills': ['research'],
+                'minimum_ai_match_score': 0,
+            },
+            {
+                'education_requirements': 'Applicants must hold a PhD.',
+                'skills': ['research'],
+                'remote_worldwide': True,
+                'opportunity_type': 'fellowship',
+            },
+        )
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['eligibility_status'], 'requirements_conflict')
+
+    def test_structured_education_requirement_matching_profile_remains_eligible(self):
+        result = compute_match_score(
+            {
+                'degree': 'PhD',
+                'education': 'Doctor of Philosophy',
+                'current_country': 'Ethiopia',
+                'worldwide_preference': True,
+                'minimum_ai_match_score': 0,
+            },
+            {
+                'education_requirements': 'Applicants must hold a PhD.',
+                'remote_worldwide': True,
+                'opportunity_type': 'fellowship',
+            },
+        )
+
+        self.assertTrue(result['eligible'])
+        self.assertEqual(result['requirements_status'], 'clear')
+
+    def test_structured_education_requirement_without_profile_data_requires_review(self):
+        result = compute_match_score(
+            {
+                'skills': ['research'],
+                'minimum_ai_match_score': 0,
+            },
+            {
+                'qualifications': 'A Master degree is required.',
+                'skills': ['research'],
+                'remote_worldwide': True,
+                'opportunity_type': 'fellowship',
+            },
+        )
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['eligibility_status'], 'requirements_unconfirmed')
 
     @patch('opportunity_agent.tasks.AIClient.generate_cover_letter', return_value='Reviewed cover letter')
     def test_manual_match_threshold_override_is_explicit_and_audited(self, generate_cover_letter):
@@ -1254,6 +3335,369 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(telegram_source.status, 'active')
         self.assertIsNotNone(telegram_source.last_successful_scan)
         collect_channel.assert_called_once()
+        self.assertEqual(
+            collect_channel.call_args.kwargs['min_message_id'],
+            0,
+        )
+
+    @patch(
+        'opportunity_agent.tasks._upsert_opportunity',
+        return_value=(None, False),
+    )
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={},
+    )
+    @patch(
+        'opportunity_agent.services.telegram_collector.collect_public_channel',
+        new_callable=AsyncMock,
+    )
+    def test_telegram_scanning_resumes_after_last_message_and_extracts_labeled_link(
+        self,
+        collect_channel,
+        extract,
+        upsert,
+    ):
+        from .tasks import scan_telegram_sources_task
+
+        source = TelegramSource.objects.create(
+            name='Public opportunities channel',
+            channel_url='https://t.me/public_opportunities',
+            last_message_id=100,
+        )
+        collect_channel.return_value = [{
+            'title': 'Research Fellowship',
+            'url': 'https://t.me/public_opportunities/101',
+            'text': 'Research Fellowship. Apply Now: https://apply.example.org/form',
+            'message_id': 101,
+        }]
+
+        result = scan_telegram_sources_task.run(
+            limit=1,
+            telegram_source_ids=[source.pk],
+        )
+
+        source.refresh_from_db()
+        self.assertEqual(result['successful'], 1)
+        collect_channel.assert_awaited_once_with(
+            source,
+            limit=50,
+            min_message_id=100,
+        )
+        self.assertEqual(source.last_message_id, 101)
+        self.assertEqual(
+            upsert.call_args.args[1]['application_url'],
+            'https://apply.example.org/form',
+        )
+
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={},
+    )
+    @patch(
+        'opportunity_agent.tasks._upsert_opportunity',
+        side_effect=RuntimeError('temporary extraction failure'),
+    )
+    @patch(
+        'opportunity_agent.services.telegram_collector.collect_public_channel',
+        new_callable=AsyncMock,
+    )
+    def test_telegram_candidate_failure_persists_retry_before_advancing_cursor(
+        self,
+        collect_channel,
+        upsert,
+        extract,
+    ):
+        from .tasks import scan_telegram_sources_task
+
+        source = TelegramSource.objects.create(
+            name='Retry channel',
+            channel_url='https://t.me/retry_channel',
+        )
+        collect_channel.return_value = [{
+            'title': 'Research fellowship',
+            'url': 'https://t.me/retry_channel/201',
+            'text': 'Research fellowship with explicit eligibility details.',
+            'message_id': 201,
+        }]
+
+        result = scan_telegram_sources_task.run(
+            limit=1,
+            telegram_source_ids=[source.pk],
+        )
+
+        source.refresh_from_db()
+        retry = TelegramMessageRetry.objects.get(source=source, message_id=201)
+        self.assertEqual(retry.status, 'pending')
+        self.assertEqual(retry.retry_count, 1)
+        self.assertGreater(retry.next_retry_at, timezone.now())
+        self.assertEqual(retry.message_text, collect_channel.return_value[0]['text'])
+        self.assertEqual(source.last_message_id, 201)
+        self.assertEqual(result['candidate_errors'][0]['message_id'], 201)
+
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={},
+    )
+    @patch(
+        'opportunity_agent.tasks._upsert_opportunity',
+        side_effect=[RuntimeError('first post is broken'), (None, False)],
+    )
+    @patch(
+        'opportunity_agent.services.telegram_collector.collect_public_channel',
+        new_callable=AsyncMock,
+    )
+    def test_failed_telegram_post_does_not_block_later_posts(
+        self,
+        collect_channel,
+        upsert,
+        extract,
+    ):
+        from .tasks import scan_telegram_sources_task
+
+        source = TelegramSource.objects.create(
+            name='Continuing channel',
+            channel_url='https://t.me/continuing_channel',
+        )
+        collect_channel.return_value = [
+            {
+                'title': 'Broken fellowship',
+                'url': 'https://t.me/continuing_channel/301',
+                'text': 'Broken fellowship post.',
+                'message_id': 301,
+            },
+            {
+                'title': 'Working fellowship',
+                'url': 'https://t.me/continuing_channel/302',
+                'text': 'Working fellowship post.',
+                'message_id': 302,
+            },
+        ]
+
+        scan_telegram_sources_task.run(
+            limit=1,
+            telegram_source_ids=[source.pk],
+        )
+
+        source.refresh_from_db()
+        self.assertEqual(source.last_message_id, 302)
+        self.assertTrue(
+            TelegramMessageRetry.objects.filter(
+                source=source,
+                message_id=301,
+                status='pending',
+            ).exists(),
+        )
+        self.assertEqual(upsert.call_count, 2)
+
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={},
+    )
+    @patch(
+        'opportunity_agent.services.telegram_collector.collect_public_channel',
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+    def test_due_telegram_retry_success_resolves_without_duplicate_opportunity(
+        self,
+        collect_channel,
+        extract,
+    ):
+        from .tasks import scan_telegram_sources_task
+
+        source = TelegramSource.objects.create(
+            name='Retry success channel',
+            channel_url='https://t.me/retry_success',
+        )
+        text = 'Research Fellowship: apply by sending the completed form.'
+        existing, created = deduplicate_and_save_opportunity(
+            source,
+            {
+                'title': 'Research Fellowship',
+                'description': text,
+                'source_url': 'https://t.me/retry_success/401',
+            },
+            raw_content=text,
+        )
+        self.assertTrue(created)
+        retry = TelegramMessageRetry.objects.create(
+            source=source,
+            channel_identifier='retry_success',
+            message_id=401,
+            message_text=text,
+            retry_count=1,
+            next_retry_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        scan_telegram_sources_task.run(
+            limit=1,
+            telegram_source_ids=[source.pk],
+        )
+
+        retry.refresh_from_db()
+        self.assertEqual(retry.status, 'resolved')
+        self.assertIsNone(retry.next_retry_at)
+        self.assertIsNotNone(retry.resolved_at)
+        self.assertEqual(
+            Opportunity.objects.filter(telegram_source=source).count(),
+            1,
+        )
+        self.assertEqual(existing.pk, Opportunity.objects.get(telegram_source=source).pk)
+
+    @override_settings(
+        TELEGRAM_POST_RETRY_MAX_ATTEMPTS=4,
+        TELEGRAM_POST_RETRY_BASE_SECONDS=10,
+        TELEGRAM_POST_RETRY_MAX_SECONDS=100,
+    )
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={},
+    )
+    @patch(
+        'opportunity_agent.tasks._upsert_opportunity',
+        side_effect=RuntimeError('still temporarily broken'),
+    )
+    @patch(
+        'opportunity_agent.services.telegram_collector.collect_public_channel',
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+    def test_telegram_retry_failure_uses_exponential_backoff(
+        self,
+        collect_channel,
+        upsert,
+        extract,
+    ):
+        from .tasks import scan_telegram_sources_task
+
+        source = TelegramSource.objects.create(
+            name='Backoff channel',
+            channel_url='https://t.me/backoff_channel',
+        )
+        retry = TelegramMessageRetry.objects.create(
+            source=source,
+            channel_identifier='backoff_channel',
+            message_id=501,
+            message_text='Research post with requirements.',
+            retry_count=1,
+            next_retry_at=timezone.now() - timedelta(seconds=1),
+        )
+        before = timezone.now()
+
+        scan_telegram_sources_task.run(
+            limit=1,
+            telegram_source_ids=[source.pk],
+        )
+
+        retry.refresh_from_db()
+        self.assertEqual(retry.retry_count, 2)
+        self.assertEqual(retry.status, 'pending')
+        self.assertGreaterEqual(
+            (retry.next_retry_at - before).total_seconds(),
+            19,
+        )
+        self.assertLessEqual(
+            (retry.next_retry_at - before).total_seconds(),
+            21,
+        )
+
+    @override_settings(
+        TELEGRAM_POST_RETRY_MAX_ATTEMPTS=3,
+        TELEGRAM_POST_RETRY_BASE_SECONDS=10,
+        TELEGRAM_POST_RETRY_MAX_SECONDS=100,
+    )
+    @patch(
+        'opportunity_agent.tasks.AIClient.extract_opportunity',
+        return_value={},
+    )
+    @patch(
+        'opportunity_agent.tasks._upsert_opportunity',
+        side_effect=RuntimeError('permanent processing failure'),
+    )
+    @patch(
+        'opportunity_agent.services.telegram_collector.collect_public_channel',
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+    def test_telegram_retry_moves_to_dead_letter_at_max_attempts(
+        self,
+        collect_channel,
+        upsert,
+        extract,
+    ):
+        from .tasks import scan_telegram_sources_task
+
+        source = TelegramSource.objects.create(
+            name='Dead letter channel',
+            channel_url='https://t.me/dead_letter_channel',
+        )
+        retry = TelegramMessageRetry.objects.create(
+            source=source,
+            channel_identifier='dead_letter_channel',
+            message_id=601,
+            message_text='Research post requiring manual review.',
+            retry_count=2,
+            next_retry_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        scan_telegram_sources_task.run(
+            limit=1,
+            telegram_source_ids=[source.pk],
+        )
+
+        retry.refresh_from_db()
+        self.assertEqual(retry.retry_count, 3)
+        self.assertEqual(retry.status, 'dead_letter')
+        self.assertIsNone(retry.next_retry_at)
+        self.assertIn('permanent processing failure', retry.last_error)
+
+    def test_legacy_telegram_scanner_is_disabled_in_favor_of_canonical_task(self):
+        from .services.telegram_sources import collect_telegram_source
+        from .tasks import scan_telegram_sources_task
+
+        with self.assertRaisesRegex(RuntimeError, 'canonical Celery scanner'):
+            collect_telegram_source(
+                TelegramSource(
+                    name='Legacy channel',
+                    channel_url='https://t.me/legacy_channel',
+                ),
+            )
+        self.assertEqual(scan_telegram_sources_task.name, 'opportunity_agent.tasks.scan_telegram_sources_task')
+
+    def test_telegram_notification_errors_do_not_expose_bot_token(self):
+        from .services.telegram import TelegramNotifier
+
+        token = '123456:secret-telegram-token'
+        destination = TelegramDestination.objects.create(
+            name='Applied notifications',
+            chat_id='-100123',
+            type='applied',
+        )
+        error = requests.ConnectionError(
+            f'Connection failed for https://api.telegram.org/bot{token}/sendMessage',
+        )
+        notifier = TelegramNotifier(bot_token=token)
+
+        with patch(
+            'opportunity_agent.services.telegram.requests.post',
+            side_effect=error,
+        ), patch('opportunity_agent.services.telegram.time.sleep'), self.assertLogs(
+            'opportunity_agent.services.telegram',
+            level='ERROR',
+        ) as captured:
+            result = notifier.send_to_enabled_destinations('applied', 'submitted')
+
+        audit = AuditLog.objects.get(
+            action='telegram_notification_failed',
+            target=str(destination.pk),
+        )
+        for value in (
+            result[0]['error'],
+            str(audit.details),
+            '\n'.join(captured.output),
+        ):
+            self.assertNotIn(token, value)
 
     def test_telegram_collection_never_starts_an_unauthorized_login(self):
         import asyncio
@@ -1924,7 +4368,7 @@ class OpportunityAgentTestCase(TestCase):
                     self.assertIn(expected, notified_message)
 
     @patch('opportunity_agent.tasks.requests.get')
-    @patch('opportunity_agent.tasks.socket.getaddrinfo')
+    @patch('opportunity_agent.services.public_http.socket.getaddrinfo')
     def test_source_scan_checks_url_and_records_success(self, getaddrinfo, get):
         from .tasks import scan_sources_task
         getaddrinfo.return_value = [
@@ -1949,7 +4393,9 @@ class OpportunityAgentTestCase(TestCase):
             source.url,
             headers={'User-Agent': 'OpportunityHubSourceMonitor/1.0'},
             timeout=15,
+            params=None,
             allow_redirects=False,
+            stream=True,
         )
 
     @patch('opportunity_agent.tasks.requests.get')
@@ -1972,7 +4418,7 @@ class OpportunityAgentTestCase(TestCase):
         get.assert_not_called()
 
     @patch('opportunity_agent.tasks.requests.get')
-    @patch('opportunity_agent.tasks.socket.getaddrinfo')
+    @patch('opportunity_agent.services.public_http.socket.getaddrinfo')
     def test_source_scan_continues_after_an_individual_source_failure(self, getaddrinfo, get):
         from .tasks import scan_sources_task
 
@@ -2014,7 +4460,7 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(healthy_source.status, 'active')
 
     @patch('opportunity_agent.services.source_discovery._fetch_public_page')
-    @patch('opportunity_agent.services.source_discovery.socket.getaddrinfo')
+    @patch('opportunity_agent.services.public_http.socket.getaddrinfo')
     def test_discovery_verifies_public_relevant_pages_and_classifies_them(self, getaddrinfo, fetch):
         from .services.source_discovery import _inspect_candidate
 
@@ -2038,8 +4484,75 @@ class OpportunityAgentTestCase(TestCase):
         self.assertTrue(result['auto_discovered'])
         fetch.assert_called_once()
 
+    @override_settings(DISCOVERY_MAX_PER_CYCLE=1, DISCOVERY_PAGE_SIZE=2)
+    @patch(
+        'opportunity_agent.services.source_discovery._inspect_candidate',
+        side_effect=lambda name, url: {
+            'name': name,
+            'url': url,
+            'source_type': 'job_site',
+            'country': 'Worldwide',
+            'opportunity_types': ['job'],
+            'trust_score': 0.7,
+            'enabled': True,
+            'scan_frequency': 'weekly',
+            'notes': '',
+            'auto_discovered': True,
+        },
+    )
+    @patch('opportunity_agent.services.source_discovery.get_public_response')
+    @patch('opportunity_agent.services.public_http.socket.getaddrinfo')
+    def test_discovery_rotates_queries_and_preserves_unprocessed_page_results(
+        self,
+        getaddrinfo,
+        get_response,
+        inspect_candidate,
+    ):
+        from .models import SystemSetting
+        from .services.source_discovery import discover_public_sources
+
+        static_candidates = patch(
+            'opportunity_agent.services.source_discovery.PUBLIC_SOURCE_CANDIDATES',
+            [],
+        )
+        getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443)),
+        ]
+        def query_response(*args, **kwargs):
+            response = Mock()
+            response.text = (
+                '<a class="result__a" href="https://jobs.example.org/one">Job One</a>'
+                '<a class="result__a" href="https://jobs.example.org/two">Job Two</a>'
+                if kwargs['params']['q'] != '"internship"'
+                else '<a class="result__a" href="https://jobs.example.org/three">Job Three</a>'
+                '<a class="result__a" href="https://jobs.example.org/four">Job Four</a>'
+            )
+            response.close.return_value = None
+            return response
+
+        get_response.side_effect = query_response
+
+        with static_candidates:
+            first = discover_public_sources(['jobs', 'scholarship', 'fellowship', 'internship'])
+            state = json.loads(SystemSetting.objects.get(
+                key='public_source_discovery_state',
+            ).value)
+            second = discover_public_sources(['jobs', 'scholarship', 'fellowship', 'internship'])
+            updated_state = json.loads(SystemSetting.objects.get(
+                key='public_source_discovery_state',
+            ).value)
+
+        self.assertLessEqual(len(first), 1)
+        self.assertLessEqual(len(second), 1)
+        self.assertEqual(get_response.call_args_list[0].kwargs['params']['s'], 0)
+        self.assertEqual(state['offsets']['0'], 1)
+        self.assertEqual(get_response.call_args_list[1].kwargs['params']['q'], '"internship"')
+        self.assertEqual(updated_state['query_index'], 0)
+        self.assertEqual(updated_state['offsets']['1'], 1)
+        self.assertEqual(inspect_candidate.call_count, 2)
+
     @patch('opportunity_agent.services.source_discovery._fetch_public_page')
-    @patch('opportunity_agent.services.source_discovery.socket.getaddrinfo')
+    @patch('opportunity_agent.services.public_http.socket.getaddrinfo')
     def test_discovery_rejects_access_barriers_and_irrelevant_pages(self, getaddrinfo, fetch):
         from .services.source_discovery import _inspect_candidate
 
@@ -2080,7 +4593,11 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(execution.call_count, 1)
         self.assertEqual(expiration.call_count, 1)
 
-    def test_application_queue_calculates_match_before_preparing(self):
+    @patch(
+        'opportunity_agent.tasks.AIClient.generate_cover_letter',
+        return_value='Reviewed cover letter',
+    )
+    def test_application_queue_calculates_match_before_preparing(self, generate_cover_letter):
         from .tasks import process_application_queue_task
         application = Application.objects.create(user=self.user, opportunity=self.opportunity, status='queued')
 
@@ -2141,6 +4658,15 @@ class OpportunityAgentTestCase(TestCase):
                 'fields': 0,
                 'buttons': ['Continue'],
             },
+            *[
+                {
+                    'url': f'https://example.com/apply/step-{index}',
+                    'text': f'Application section {index}',
+                    'fields': 0,
+                    'buttons': ['Continue'],
+                }
+                for index in range(1, 26)
+            ],
             {
                 'url': 'https://example.com/apply/details',
                 'text': 'Application details',
@@ -2269,7 +4795,31 @@ class OpportunityAgentTestCase(TestCase):
         )
         self.assertIn('Continue', application.workflow_state['completed_actions'])
         self.assertIsNotNone(application.submission_time)
-        self.assertEqual(application.result_url, states[2]['url'])
+        self.assertEqual(application.result_url, states[-1]['url'])
+
+    @override_settings(APPLICATION_WORKFLOW_BUDGET_SECONDS=1)
+    def test_expired_application_workflow_is_routed_to_review(self):
+        from .services.provider_adapters import PlaywrightConfiguredAdapter
+
+        application = Application.objects.create(
+            user=self.user,
+            opportunity=self.opportunity,
+            status='pending',
+            workflow_state={
+                'workflow_started_at': (
+                    timezone.now() - timedelta(seconds=2)
+                ).isoformat(),
+            },
+        )
+        adapter = PlaywrightConfiguredAdapter()
+
+        result = adapter._run_dynamic_workflow(application, None, None)
+
+        application.refresh_from_db()
+        self.assertFalse(result)
+        self.assertEqual(application.status, 'needs_review')
+        self.assertEqual(application.workflow_state['outcome'], 'needs_review')
+        self.assertIn('time budget expired', application.error_message)
 
     def test_unsupported_provider_is_sent_to_review_with_reason(self):
         from .services.provider_adapters import ManualReviewAdapter
@@ -2580,10 +5130,14 @@ class OpportunityAgentTestCase(TestCase):
         self.assertEqual(response.context['profile'], self.profile)
         self.assertEqual(response.context['needs_review_count'], 0)
         self.assertEqual(response.context['daily_count'], 0)
-        self.assertEqual(list(response.context['matches']), [Match.objects.get(
+        self.assertIn(Match.objects.get(
             user=self.user,
             opportunity=deadline_opportunity,
-        )])
+        ), response.context['matches'])
+        self.assertEqual(
+            {match.user_id for match in response.context['matches']},
+            {self.user.pk},
+        )
         self.assertEqual(
             list(response.context['upcoming_deadlines']),
             [deadline_opportunity],
@@ -2598,6 +5152,218 @@ class OpportunityAgentTestCase(TestCase):
         self.assertContains(response, 'Needs review')
         self.assertContains(response, 'Auto Apply:')
         self.assertContains(response, 'Daily application count')
+
+    def test_new_users_match_existing_opportunities_and_incomplete_profiles_get_fallback(self):
+        interested_user = User.objects.create_user(
+            username='new-software-user',
+            email='new-software@example.com',
+            password='StrongPass123!',
+        )
+        interested_user.groups.add(
+            interested_user.groups.model.objects.get(name='USER'),
+        )
+        interested_profile = UserProfile.objects.create(
+            user=interested_user,
+            skills=['Python', 'software development'],
+            preferred_opportunity_types=['job'],
+            minimum_ai_match_score=0,
+        )
+        self.client.force_login(interested_user)
+        response = self.client.get('/dashboard/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(Match.objects.filter(
+            user=interested_user,
+            opportunity=self.opportunity,
+        ).exists())
+        self.assertEqual(
+            {match.user_id for match in response.context['matches']},
+            {interested_user.pk},
+        )
+
+        incomplete_user = User.objects.create_user(
+            username='new-incomplete-user',
+            email='new-incomplete@example.com',
+            password='StrongPass123!',
+        )
+        incomplete_user.groups.add(
+            incomplete_user.groups.model.objects.get(name='USER'),
+        )
+        incomplete_profile = UserProfile.objects.create(user=incomplete_user)
+        self.client.force_login(incomplete_user)
+        fallback_response = self.client.get('/dashboard/')
+
+        self.assertEqual(fallback_response.status_code, 200)
+        self.assertEqual(fallback_response.context['profile'], incomplete_profile)
+        self.assertEqual(fallback_response.context['matches'], [])
+        self.assertTrue(fallback_response.context['fallback_opportunities'])
+        self.assertContains(fallback_response, 'No recommendations meet your current minimum score')
+
+    def test_saved_opportunities_are_user_scoped_and_require_authentication(self):
+        saved_opportunity = Opportunity.objects.create(
+            title='Privately saved opportunity',
+            description='A public opportunity saved to an individual user list.',
+            dedupe_hash='user-private-saved-opportunity',
+        )
+        anonymous_response = self.client.post(
+            f'/opportunities/{saved_opportunity.pk}/save/',
+            {'action': 'save'},
+        )
+        self.assertEqual(anonymous_response.status_code, 302)
+        self.assertFalse(Match.objects.filter(
+            opportunity=saved_opportunity,
+            is_saved=True,
+        ).exists())
+
+        self.client.force_login(self.user)
+        saved_response = self.client.post(
+            f'/opportunities/{saved_opportunity.pk}/save/',
+            {'action': 'save'},
+        )
+        self.assertEqual(saved_response.status_code, 302)
+        self.assertTrue(Match.objects.get(
+            user=self.user,
+            opportunity=saved_opportunity,
+        ).is_saved)
+
+        other_user = User.objects.create_user(
+            username='saved-list-other-user',
+            email='saved-list-other@example.com',
+            password='StrongPass123!',
+        )
+        other_user.groups.add(other_user.groups.model.objects.get(name='USER'))
+        self.client.force_login(other_user)
+        other_dashboard = self.client.get('/dashboard/')
+
+        self.assertEqual(other_dashboard.status_code, 200)
+        self.assertEqual(other_dashboard.context['saved_opportunities'], [])
+        self.assertFalse(
+            Match.objects.filter(
+                user=other_user,
+                opportunity=saved_opportunity,
+                is_saved=True,
+            ).exists(),
+        )
+
+    def test_authenticated_opportunity_search_ranks_and_filters_by_own_match_score(self):
+        management_opportunity = Opportunity.objects.create(
+            title='Project Management Coordinator',
+            opportunity_type='job',
+            description='Lead project coordination and administration.',
+            dedupe_hash='personalized-search-management',
+        )
+        unrelated_opportunity = Opportunity.objects.create(
+            title='Project Software Developer',
+            opportunity_type='job',
+            description='Develop software applications using Python.',
+            dedupe_hash='personalized-search-software',
+        )
+        self.profile.skills = ['management', 'project coordination']
+        self.profile.education = ''
+        self.profile.degree = ''
+        self.profile.minimum_ai_match_score = 0
+        self.profile.save(update_fields=[
+            'skills',
+            'education',
+            'degree',
+            'minimum_ai_match_score',
+        ])
+        self.client.force_login(self.user)
+
+        response = self.client.get('/opportunities/', {
+            'q': 'Project',
+            'minimum_score': '45',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [opportunity.pk for opportunity in response.context['opportunities']],
+            [management_opportunity.pk],
+            [
+                (opportunity.pk, opportunity.user_match.score)
+                for opportunity in response.context['opportunities']
+            ],
+        )
+        self.assertGreater(
+            response.context['opportunities'][0].user_match.score,
+            compute_match_score(
+                profile_match_data(self.profile),
+                opportunity_match_data(unrelated_opportunity),
+            )['score'],
+        )
+        self.assertContains(response, 'Your match:')
+
+    def test_dashboard_and_detail_show_legacy_verified_route_and_instructions(self):
+        self.opportunity.application_url = ''
+        self.opportunity.application_method = 'email'
+        self.opportunity.contact_email = 'applications@example.org'
+        self.opportunity.application_instructions = (
+            'Email your CV and application statement to this address.'
+        )
+        self.opportunity.save(update_fields=[
+            'application_url',
+            'application_method',
+            'contact_email',
+            'application_instructions',
+        ])
+        Application.objects.create(
+            user=self.user,
+            opportunity=self.opportunity,
+            status='queued',
+        )
+        self.client.force_login(self.user)
+
+        dashboard = self.client.get('/dashboard/')
+        detail = self.client.get(f'/opportunities/{self.opportunity.pk}/')
+
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertContains(dashboard, 'Verified application email')
+        self.assertContains(dashboard, 'href="mailto:applications@example.org"')
+        self.assertContains(dashboard, 'applications@example.org')
+        self.assertContains(dashboard, 'Email your CV and application statement')
+        self.assertEqual(detail.status_code, 200)
+        self.assertContains(detail, 'Verified application email')
+        self.assertContains(detail, 'href="mailto:applications@example.org"')
+        self.assertContains(detail, 'applications@example.org')
+        self.assertContains(detail, 'Email your CV and application statement')
+
+    def test_verified_email_and_online_routes_render_as_links(self):
+        self.opportunity.application_methods = [
+            {
+                'method': 'email',
+                'destination': 'applications@example.org',
+                'instructions': 'Send your CV and application statement.',
+            },
+            {
+                'method': 'online',
+                'destination': 'https://apply.example.org/role',
+                'instructions': 'Complete the official form.',
+            },
+        ]
+        self.opportunity.application_method = 'online'
+        self.opportunity.application_url = 'https://apply.example.org/role'
+        self.opportunity.save(update_fields=[
+            'application_methods',
+            'application_method',
+            'application_url',
+        ])
+        Application.objects.create(
+            user=self.user,
+            opportunity=self.opportunity,
+            status='queued',
+        )
+        self.client.force_login(self.user)
+
+        dashboard = self.client.get('/dashboard/')
+        detail = self.client.get(f'/opportunities/{self.opportunity.pk}/')
+
+        for response in (dashboard, detail):
+            self.assertEqual(response.status_code, 200)
+            self.assertContains(response, 'href="mailto:applications@example.org"')
+            self.assertContains(
+                response,
+                'href="https://apply.example.org/role"',
+            )
 
     def test_user_dashboard_status_lists_and_daily_attempt_count_are_private(self):
         from django.utils import timezone
@@ -2766,6 +5532,14 @@ class OpportunityAgentTestCase(TestCase):
 
 
 class AIClientTestCase(TestCase):
+    def setUp(self):
+        self.public_destination_validation = patch(
+            'opportunity_agent.services.source_ingestion.public_addresses',
+            return_value={ipaddress.ip_address('93.184.216.34')},
+        )
+        self.public_destination_validation.start()
+        self.addCleanup(self.public_destination_validation.stop)
+
     @patch('opportunity_agent.services.ai_engine.AIClient._request')
     def test_opportunity_extraction_processes_long_text_in_chunks(self, request):
         first_requirement = 'At least five years of field work required.'
@@ -2892,6 +5666,29 @@ class AIClientTestCase(TestCase):
         self.assertTrue(result['remote_worldwide'])
         self.assertNotIn('visa_sponsorship', result)
         self.assertEqual(result['source_url'], 'https://example.org/fellowship')
+
+    @patch('opportunity_agent.services.ai_engine.AIClient._post')
+    def test_ai_rejects_application_url_not_present_in_the_source_text(self, post):
+        post.return_value = {
+            'title': 'Research Fellowship',
+            'organization': 'Invented Organization',
+            'application_url': 'https://invented.example/apply',
+            'evidence': {
+                'title': 'Research Fellowship',
+                'organization': 'A research fellowship is open.',
+                'application_url': 'Apply through the official portal.',
+            },
+        }
+
+        result = AIClient().extract_opportunity(
+            'Research Fellowship. A research fellowship is open. '
+            'Apply through the official portal.',
+            'https://example.org/fellowship',
+        )
+
+        self.assertEqual(result.get('title'), 'Research Fellowship')
+        self.assertNotIn('organization', result)
+        self.assertNotIn('application_url', result)
 
     @patch('opportunity_agent.services.ai_engine.AIClient._post')
     def test_opportunity_ai_contact_destinations_must_match_their_source_text(self, post):
@@ -3063,7 +5860,7 @@ class AIClientTestCase(TestCase):
             ],
         )
         self.assertEqual([entry['id'] for entry in ranked], [2, 1])
-        self.assertEqual([entry['score'] for entry in ranked], [43, 43])
+        self.assertEqual([entry['score'] for entry in ranked], [63, 63])
 
     @patch.dict('os.environ', {
         'AI_API_KEY': '',
@@ -3073,6 +5870,7 @@ class AIClientTestCase(TestCase):
         'AI_MISTRAL_API_KEY': '',
         'AI_TOGETHER_API_KEY': '',
         'AI_HUGGINGFACE_API_KEY': '',
+        'AI_PROVIDER': 'google',
     }, clear=False)
     @patch('opportunity_agent.services.ai_engine.requests.post')
     def test_uses_next_provider_when_first_provider_fails(self, post):
@@ -3129,6 +5927,7 @@ class AIClientTestCase(TestCase):
         'AI_MISTRAL_API_KEY': 'mistral-key',
         'AI_TOGETHER_API_KEY': 'together-key',
         'AI_HUGGINGFACE_API_KEY': 'huggingface-key',
+        'AI_PROVIDER': 'google',
     }, clear=False)
     @patch('opportunity_agent.services.ai_engine.requests.post')
     def test_tries_all_providers_in_configured_fallback_order(self, post):
@@ -3151,3 +5950,195 @@ class AIClientTestCase(TestCase):
                 'https://api-inference.huggingface.co/v1/chat/completions',
             ],
         )
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': '',
+        'AI_GROQ_API_KEY': '',
+        'AI_OPENROUTER_API_KEY': '',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_missing_provider_fails_clearly_without_a_mock_success(self, post):
+        with self.assertRaisesRegex(AIProviderError, 'No AI provider is configured'):
+            AIClient().classify_opportunity('Research role')
+
+        post.assert_not_called()
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'google-key',
+        'AI_GROQ_API_KEY': 'groq-key',
+        'AI_OPENROUTER_API_KEY': '',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_malformed_completion_response_falls_back(self, post):
+        malformed = Mock()
+        malformed.raise_for_status.return_value = None
+        malformed.json.return_value = {
+            'choices': [{'message': {'content': '{not valid json'}}],
+        }
+        success = Mock()
+        success.raise_for_status.return_value = None
+        success.json.return_value = {
+            'choices': [{
+                'message': {
+                    'content': json.dumps({
+                        'is_opportunity': True,
+                        'opportunity_type': 'job',
+                        'confidence': 0.9,
+                        'evidence': {
+                            'is_opportunity': 'Research role',
+                            'opportunity_type': 'Research role',
+                        },
+                    }),
+                },
+            }],
+        }
+        post.side_effect = [malformed, success]
+
+        result = AIClient().classify_opportunity('Research role')
+
+        self.assertTrue(result['is_opportunity'])
+        self.assertEqual(post.call_count, 2)
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'google-key',
+        'AI_GROQ_API_KEY': 'groq-key',
+        'AI_OPENROUTER_API_KEY': '',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+        'AI_PROVIDER': 'google',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_provider_error_object_uses_fallback(self, post):
+        error_response = Mock()
+        error_response.raise_for_status.return_value = None
+        error_response.json.return_value = {
+            'error': {'message': 'The provider rejected this request.'},
+        }
+        fallback_response = Mock()
+        fallback_response.raise_for_status.return_value = None
+        fallback_response.json.return_value = {
+            'choices': [{'message': {'content': '{"is_opportunity": null}'}}],
+        }
+        post.side_effect = [error_response, fallback_response]
+
+        result = AIClient().classify_opportunity('Research role')
+
+        self.assertIsNone(result['is_opportunity'])
+        self.assertEqual(post.call_count, 2)
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'google-key',
+        'AI_GROQ_API_KEY': 'groq-key',
+        'AI_OPENROUTER_API_KEY': 'openrouter-key',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+        'AI_PROVIDER': 'groq',
+    }, clear=False)
+    def test_preferred_provider_is_first_and_fallback_order_is_stable(self):
+        self.assertEqual(
+            [provider.name for provider in AIClient()._providers()],
+            ['groq', 'google', 'openrouter'],
+        )
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'google-key',
+        'AI_GROQ_API_KEY': '',
+        'AI_OPENROUTER_API_KEY': '',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+        'AI_TIMEOUT': '17',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_provider_timeout_is_applied(self, post):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            'choices': [{'message': {'content': '{"is_opportunity": null}'}}],
+        }
+        post.return_value = response
+
+        AIClient().classify_opportunity('Research role')
+
+        self.assertEqual(post.call_args.kwargs['timeout'], 17)
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'google-key',
+        'AI_GROQ_API_KEY': 'groq-key',
+        'AI_OPENROUTER_API_KEY': '',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+        'AI_PROVIDER': 'google',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_provider_timeout_falls_back(self, post):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            'choices': [{'message': {'content': '{"is_opportunity": null}'}}],
+        }
+        post.side_effect = [requests.Timeout('First provider timed out.'), response]
+
+        AIClient().classify_opportunity('Research role')
+
+        self.assertEqual(post.call_count, 2)
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'secret-google-key',
+        'AI_GROQ_API_KEY': '',
+        'AI_OPENROUTER_API_KEY': '',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+        'AI_PROVIDER': 'google',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_provider_failures_do_not_expose_api_keys(self, post):
+        secret = 'secret-google-key'
+        post.side_effect = requests.ConnectionError(
+            f'Failed for key={secret}',
+        )
+
+        with self.assertRaises(AIProviderError) as caught:
+            AIClient().classify_opportunity('Research role')
+
+        self.assertNotIn(secret, str(caught.exception))
+
+    @patch.dict('os.environ', {
+        'AI_API_KEY': '',
+        'AI_GOOGLE_API_KEY': 'google-key',
+        'AI_GROQ_API_KEY': 'groq-key',
+        'AI_OPENROUTER_API_KEY': 'openrouter-key',
+        'AI_MISTRAL_API_KEY': '',
+        'AI_TOGETHER_API_KEY': '',
+        'AI_HUGGINGFACE_API_KEY': '',
+        'AI_PROVIDER': 'google',
+    }, clear=False)
+    @patch('opportunity_agent.services.ai_engine.requests.post')
+    def test_successful_preferred_provider_stops_fallback(self, post):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            'choices': [{'message': {'content': '{"is_opportunity": null}'}}],
+        }
+        post.return_value = response
+
+        AIClient().classify_opportunity('Research role')
+
+        self.assertEqual(post.call_count, 1)

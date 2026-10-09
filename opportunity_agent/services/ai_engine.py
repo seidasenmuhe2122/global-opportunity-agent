@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
+from django.conf import settings
 
 
 @dataclass(frozen=True)
@@ -19,8 +20,8 @@ class _Provider:
 
 
 _FALLBACK_PROVIDERS = (
-    ('google', 'AI_GOOGLE_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/', 'gemini-3.5-flash-lite'),
-    ('groq', 'AI_GROQ_API_KEY', 'https://api.groq.com/openai/v1', 'llama-3.3-70b-versatile'),
+    ('google', 'AI_GOOGLE_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/', 'gemini-3.8-flash'),
+    ('groq', 'AI_GROQ_API_KEY', 'https://api.groq.com/openai/v1', 'openai/gpt-oss-120b'),
     ('openrouter', 'AI_OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1', 'deepseek/deepseek-r1:free'),
     ('mistral', 'AI_MISTRAL_API_KEY', 'https://api.mistral.ai/v1', 'mistral-small-latest'),
     ('together', 'AI_TOGETHER_API_KEY', 'https://api.together.xyz/v1', 'meta-llama/Llama-3.3-70B-Instruct-Turbo'),
@@ -82,6 +83,51 @@ def _contains_verbatim(values: list[str], quote: Any) -> bool:
     )
 
 
+def _verified_application_url(value: str, text: str, source_url: str, *, form=False) -> str:
+    from .source_ingestion import (
+        APPLICATION_LINK_PATTERN,
+        _application_link_context,
+        _is_application_destination,
+    )
+
+    for match in re.finditer(r'https?://[^\s<>"\']+', text, re.I):
+        found = match.group(0).rstrip('.,);')
+        if found != value.strip().rstrip('.,);'):
+            continue
+        context = _application_link_context(text, match.start())
+        if not APPLICATION_LINK_PATTERN.search(context):
+            continue
+        if form and not re.search(r'\.(?:pdf|docx?)$', urlsplit(found).path, re.I):
+            continue
+        return _is_application_destination(found, (source_url,))
+    return ''
+
+
+def _boolean_is_explicit(field: str, value: bool, quote: str) -> bool:
+    text = ' '.join(quote.split()).casefold()
+    if field == 'remote_worldwide':
+        if value:
+            return bool(re.search(r'\bremote\b.{0,50}\bworldwide\b|\bworldwide\b.{0,50}\bremote\b', text))
+        return bool(re.search(
+            r'\b(?:not|no longer|unavailable)\b.{0,40}\b(?:worldwide|remote)\b|'
+            r'\b(?:worldwide|remote)\b.{0,40}\b(?:not available|is not|isn.t|only in)\b',
+            text,
+        ))
+    if field == 'visa_sponsorship':
+        if value:
+            return bool(re.search(
+                r'\bvisa sponsorship\b.{0,40}\b(?:available|provided|offered|yes)\b|'
+                r'\b(?:available|provided|offered)\b.{0,40}\bvisa sponsorship\b',
+                text,
+            ))
+        return bool(re.search(
+            r'\b(?:no|not|unavailable|does not|doesn.t|isn.t)\b.{0,40}\bvisa sponsorship\b|'
+            r'\bvisa sponsorship\b.{0,40}\b(?:not available|unavailable|is not|isn.t)\b',
+            text,
+        ))
+    return False
+
+
 def _extraction_chunks(text: str, max_chars: int = 20000, overlap: int = 1000) -> list[str]:
     if len(text) <= 24000:
         return [text]
@@ -110,9 +156,18 @@ class AIClient:
 
     def __init__(self, api_key=None, base_url=None, model=None):
         self.api_key = api_key if api_key is not None else os.environ.get('AI_API_KEY', '')
-        self.base_url = base_url if base_url is not None else os.environ.get('AI_BASE_URL', '')
-        self.model = model if model is not None else os.environ.get('AI_MODEL', 'gpt-4o-mini')
-        self.provider = os.environ.get('AI_PROVIDER', 'openai-compatible').strip().lower()
+        self.base_url = (
+            base_url if base_url is not None
+            else os.environ.get('AI_BASE_URL') or getattr(settings, 'AI_BASE_URL', '')
+        )
+        self.model = (
+            model if model is not None
+            else os.environ.get('AI_MODEL') or getattr(settings, 'AI_MODEL', 'gpt-4o-mini')
+        )
+        self.provider = os.environ.get(
+            'AI_PROVIDER',
+            getattr(settings, 'AI_PROVIDER', 'openai-compatible'),
+        ).strip().lower()
         self._explicit_config = any(value is not None for value in (api_key, base_url, model))
         try:
             self.timeout = max(1, min(int(os.environ.get('AI_TIMEOUT', '30')), 120))
@@ -165,9 +220,15 @@ class AIClient:
 
     @staticmethod
     def _parse_response(response: Any) -> dict:
-        if isinstance(response, dict) and 'choices' not in response:
-            return response
-        content = response.get('choices', [{}])[0].get('message', {}).get('content')
+        if not isinstance(response, dict):
+            raise ValueError('AI provider response must be a JSON object.')
+        choices = response.get('choices')
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError('AI provider response did not contain a chat completion choice.')
+        message = choices[0].get('message')
+        if not isinstance(message, dict):
+            raise ValueError('AI provider response did not contain a chat completion message.')
+        content = message.get('content')
         if isinstance(content, list):
             content = ''.join(
                 part.get('text', '')
@@ -187,7 +248,10 @@ class AIClient:
     def _post(self, payload: dict) -> dict:
         providers = self._providers()
         if not providers:
-            return {'status': 'mock', 'response': payload}
+            raise AIProviderError(
+                'No AI provider is configured. Set AI_API_KEY and AI_BASE_URL, '
+                'or configure one of the supported AI_*_API_KEY values.'
+            )
         failures = []
         for provider in providers:
             try:
@@ -217,12 +281,28 @@ class AIClient:
                 )
                 response.raise_for_status()
                 return self._parse_response(response.json())
-            except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-                failures.append(f'{provider.name}: {exc}')
+            except (
+                requests.RequestException,
+                ValueError,
+                KeyError,
+                IndexError,
+                TypeError,
+                AttributeError,
+            ) as exc:
+                status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                if isinstance(status, int):
+                    failure = f'HTTP {status}'
+                elif isinstance(exc, requests.Timeout):
+                    failure = 'request timed out'
+                elif isinstance(exc, requests.RequestException):
+                    failure = 'network request failed'
+                else:
+                    failure = 'invalid provider response'
+                failures.append(f'{provider.name}: {failure}')
         provider_names = ', '.join(provider.name for provider in providers)
         raise AIProviderError(
             f'All configured AI providers failed ({provider_names}): ' + ' | '.join(failures)
-        )
+        ) from None
 
     def _request(self, task: str, schema: dict, instruction: str, **inputs) -> dict:
         return self._post({
@@ -435,14 +515,19 @@ class AIClient:
             if not _contains_verbatim([text], quote):
                 continue
             if field in BOOLEAN_FIELDS:
-                if isinstance(value, bool):
+                if isinstance(value, bool) and _boolean_is_explicit(field, value, quote):
                     output[field] = value
             elif field == 'deadline':
                 if isinstance(value, str) and value.strip():
-                    from .deadlines import parse_deadline
+                    from .deadlines import extract_explicit_deadline, parse_deadline
 
                     parsed_deadline = parse_deadline(value.strip())
-                    if parsed_deadline is not None:
+                    evidence_deadline = extract_explicit_deadline(quote)
+                    if (
+                        parsed_deadline is not None
+                        and evidence_deadline is not None
+                        and parsed_deadline.date() == evidence_deadline.date()
+                    ):
                         output[field] = parsed_deadline
             elif field in {'skills', 'languages'}:
                 if isinstance(value, list):
@@ -460,6 +545,30 @@ class AIClient:
                     continue
                 if field == 'work_mode' and value not in {'on_site', 'hybrid', 'remote'}:
                     continue
+                if field in {'title', 'organization', 'country', 'city'} and not _contains_verbatim(
+                    [quote],
+                    value,
+                ):
+                    continue
+                if field == 'application_url':
+                    if not _contains_verbatim([quote], value):
+                        continue
+                    verified_url = _verified_application_url(value, text, source_url)
+                    if not verified_url:
+                        continue
+                    value = verified_url
+                if field == 'application_form_url':
+                    if not _contains_verbatim([quote], value):
+                        continue
+                    verified_url = _verified_application_url(
+                        value,
+                        text,
+                        source_url,
+                        form=True,
+                    )
+                    if not verified_url:
+                        continue
+                    value = verified_url
                 if field in CONTACT_FIELDS:
                     value = value.strip()
                     if not _contains_verbatim([text], value):

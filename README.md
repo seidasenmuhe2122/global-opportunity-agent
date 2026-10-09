@@ -104,6 +104,10 @@ All website/API and RSS/Telegram ingestion paths share the same duplicate detect
 
 Match scores combine listed skills, education, experience, location, opportunity type, languages, work mode, sponsorship, qualifications, and compensation preferences. Each result includes the score, reasons, strong matches, missing or unconfirmed requirements, risks, eligibility, and a recommended action. Unknown opportunity facts are called out instead of being treated as matches. Automatic queueing requires the user's minimum score and matching location/work-mode preferences. A signed-in user can explicitly check the threshold-override option on an opportunity page to queue a below-threshold match; the action is recorded on the application and in the audit log. The override never bypasses location or work-mode restrictions, daily limits, CV/profile requirements, auto-apply settings, or provider safety checks.
 
+Opportunity records are shared across users, while `Match` records and saved-state are unique to each user/opportunity pair. Matching uses each user's own skills and career-interest text, education, experience, location and preferences against structured fields and the opportunity's title and source description. The dashboard refreshes stale or missing matches for the signed-in user, including existing opportunities for newly registered users; source ingestion independently matches newly collected records to active users. Authenticated opportunity search ranks results by that user's score and supports country, type, work mode, qualification, deadline and minimum-score filters. An incomplete profile with no qualifying recommendations sees general active opportunities and is prompted to improve the profile. Saving an opportunity is private to the signed-in user and is stored on their match record; apply migration `0026_match_is_saved` before deploying this version.
+
+Application-status notifications are sent through configured Telegram destinations. Although profiles store `notification_preferences`, per-user notifications for new opportunity matches are not currently implemented. The application does not claim those notifications are sent.
+
 ## Production
 Use PostgreSQL via `DATABASE_URL`, Redis via `REDIS_URL`, and an S3-compatible shared media bucket via `AWS_STORAGE_BUCKET_NAME` (plus region/endpoint and access credentials as needed). Set `DEBUG=0`, a strong `DJANGO_SECRET_KEY`, stable `CREDENTIAL_ENCRYPTION_KEY`, `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, AI keys and Telegram configuration. The Render blueprint defines separate web, Celery worker and Celery Beat services; all three require the same database, Redis, Django secret, credential-encryption key and media-storage settings. Shared object storage is required so uploaded CVs and generated forms are available to Celery workers.
 
@@ -117,6 +121,54 @@ python manage.py makemigrations --check
 python manage.py test
 ```
 
+## Auditing legacy application routes
+The read-only-by-default `audit_application_routes` command checks saved source
+URLs, reports listing-page candidates and fetches public detail pages to identify
+explicit application routes. It does not use an AI provider. Review its output
+before making any changes:
+
+```powershell
+python manage.py audit_application_routes
+```
+
+For a detailed read-only CSV review (including current/proposed route fields,
+classification, and source evidence), choose a new report path:
+
+```powershell
+python manage.py audit_application_routes --report-csv .\application-route-review.csv
+```
+
+The report mode fetches saved public source pages for verification but does not
+write to the database. Existing reports are never overwritten; choose another
+path to rerun it. Historical or potentially expired routes are separated from
+currently verified routes and are not proposed as new application routes.
+
+Migration `0025` adds `application_methods` (a JSON list defaulting to `[]`) and
+`application_instructions` (blank text); it does not infer or backfill either
+field for existing opportunities. Older records can therefore have an empty
+route list and instructions even when their legacy `application_method` or
+application URL is populated. The audit command rechecks the saved source page
+and proposes only explicit, verified evidence; it does not change records unless
+`--apply` is provided.
+
+Before applying repairs, back up the database using the deployment's normal
+database backup procedure. For a portable Django data backup, create the target
+directory first and run:
+
+```powershell
+New-Item -ItemType Directory -Force .\backups
+python manage.py dumpdata opportunity_agent.Opportunity --indent 2 --output .\backups\opportunities-before-routes.json
+python manage.py audit_application_routes --apply --backup-file .\backups\route-audit-changes.json --confirm "APPLY VERIFIED ROUTE REPAIRS"
+```
+
+`--apply` is explicit, requires a new command snapshot file and the exact
+confirmation phrase. The command preserves source URLs and existing saved
+application URLs, marks confirmed listing pages and historical or uncertain
+routes for review, and never deletes records. A verified opportunity detail
+page is not marked for review solely because its application method could not
+be verified. Unreachable and ambiguous pages remain reported for manual review.
+The command snapshot contains the pre-repair opportunity fields for records it
+will update.
 
 ## Credentialed applications and custom forms
 See `docs/CREDENTIALS_AND_FORMS.md`. Website credentials are encrypted at rest. Provider adapters can perform authorized login, form filling, CV upload and submission when selectors are explicitly configured. Fillable PDF application forms are supported; scanned/non-fillable forms are routed to Needs Review. CAPTCHA/MFA/anti-bot controls are never bypassed.

@@ -10,7 +10,7 @@
     <div><span class="eyebrow">PROFILE STRENGTH</span><h2>Profile: {{ profile.profile_completeness }}% complete</h2><p>Complete your profile and CV to improve matching quality.</p><p><strong>Auto Apply:</strong> {% if profile.auto_apply %}On{% else %}Off{% endif %}</p>
         {% if profile.missing_profile_fields %}<p><strong>Missing:</strong> {{ profile.missing_profile_fields|join:', ' }}</p><a class="text-link" href="{% url 'profile_edit' %}">Complete your profile →</a>{% else %}<p>All key profile sections are complete.</p>{% endif %}
     </div>
-    <div class="progress-block"><div class="progress-line"><span>Profile completeness</span><b>{{ profile.profile_completeness }}%</b></div><div class="progress-track"><div class="progress-fill" style="width:{{ profile.profile_completeness }}%"></div></div></div>
+    <div class="progress-block"><div class="progress-line"><span>Profile completeness</span><b>{{ profile.profile_completeness }}%</b></div><progress class="profile-progress" value="{{ profile.profile_completeness }}" max="100" aria-label="Profile completeness"></progress></div>
 </section>
 <section class="stats-grid">
     <article class="stat-card"><div class="stat-top">Applications <span class="stat-icon">▣</span></div><div class="stat-value">{{ application_count }}</div><div class="stat-note">All application records</div></article>
@@ -38,7 +38,14 @@
                 </span>
                 <span class="badge submitted">{{ match.score }}%</span>
             </article>
-            {% empty %}<div class="empty">No eligible matches yet. Complete your profile and run the automation engine.</div>{% endfor %}
+            {% empty %}
+                {% if fallback_opportunities %}
+                <div class="empty">No recommendations meet your current minimum score. Here are current public opportunities while you complete your profile or review your preferences:</div>
+                {% for opportunity in fallback_opportunities %}
+                <article class="list-item"><span class="list-copy"><strong><a href="{% url 'opportunity_detail' opportunity.pk %}">{{ opportunity.title }}</a></strong><p>{{ opportunity.organization|default:'Organization not specified' }} · {{ opportunity.country|default:'Location not specified' }}</p></span></article>
+                {% endfor %}
+                {% else %}<div class="empty">No eligible matches yet. Add skills and career interests, then explore opportunities.</div>{% endif %}
+            {% endfor %}
         </div>
     </section>
     <aside class="panel">
@@ -51,10 +58,51 @@
     </aside>
 </div>
 <section class="panel" style="margin-top:20px">
+    <div class="panel-head"><div><h2>Saved opportunities</h2><p>Your private saved list</p></div></div>
+    <div class="list">
+        {% for match in saved_opportunities %}
+        <div class="list-item"><span class="list-copy"><strong><a href="{% url 'opportunity_detail' match.opportunity.pk %}">{{ match.opportunity.title }}</a></strong><p>{{ match.opportunity.organization|default:'Organization not specified' }} · {{ match.opportunity.country|default:'Location not specified' }}</p></span><span class="badge">{{ match.score }}%</span></div>
+        {% empty %}<div class="empty">You have not saved any opportunities yet.</div>{% endfor %}
+    </div>
+</section>
+<section class="panel" style="margin-top:20px">
     <div class="panel-head"><div><h2>Recent applications</h2><p>Your application activity and latest status changes</p></div></div>
     <div class="list">
         {% for app in applications %}
-        <div class="list-item"><span class="list-mark">📨</span><span class="list-copy"><strong><a href="/opportunities/{{ app.opportunity.pk }}/">{{ app.opportunity.title }}</a></strong><p>{{ app.created_at|date:'M d, Y' }} · {{ app.status|title }}</p>{% if app.rejection_reason %}<p>{{ app.rejection_reason }}</p>{% elif app.error_message %}<p>{{ app.error_message }}</p>{% endif %}</span><span class="badge {{ app.status }}">{{ app.match_score }}%</span></div>
+        <div class="list-item"><span class="list-mark">📨</span><span class="list-copy"><strong><a href="/opportunities/{{ app.opportunity.pk }}/">{{ app.opportunity.title }}</a></strong><p>{{ app.created_at|date:'M d, Y' }} · {{ app.status|title }} · Application method: {{ app.opportunity.get_application_method_display }}</p>
+            {% if app.opportunity.application_methods %}
+                <p><strong>Source-verified route(s):</strong>
+                    {% for route in app.opportunity.application_methods %}
+                        {{ route.method|title }}{% if route.destination %}: {% if route.method == 'online' or route.method == 'form' %}<a class="text-link" href="{{ route.destination }}" target="_blank" rel="noopener">{{ route.destination }}</a>{% elif route.method == 'email' %}<a class="text-link" href="mailto:{{ route.destination }}">{{ route.destination }}</a>{% else %}{{ route.destination }}{% endif %}{% endif %}{% if route.instructions %} — {{ route.instructions }}{% endif %}{% if not forloop.last %}; {% endif %}
+                    {% endfor %}
+                </p>
+                {% if app.opportunity.application_method == 'source_only' %}
+                    <p><strong>Needs review:</strong> The source instructions do not establish a supported primary application method.</p>
+                {% endif %}
+            {% elif app.opportunity.application_method == 'source_only' %}
+                <p><strong>Needs review:</strong> No application method was verified. Review the official opportunity page.</p>
+            {% else %}
+                {% if app.opportunity.application_method == 'online' and app.opportunity.application_url %}
+                    <p><strong>Verified application URL:</strong> <a class="text-link" href="{{ app.opportunity.application_url }}" target="_blank" rel="noopener">{{ app.opportunity.application_url }}</a></p>
+                {% elif app.opportunity.application_method == 'form' and app.opportunity.application_form_url %}
+                    <p><strong>Verified application form:</strong> <a class="text-link" href="{{ app.opportunity.application_form_url }}" target="_blank" rel="noopener">{{ app.opportunity.application_form_url }}</a></p>
+                {% elif app.opportunity.application_method == 'email' and app.opportunity.contact_email %}
+                    <p><strong>Verified application email:</strong> <a class="text-link" href="mailto:{{ app.opportunity.contact_email }}">{{ app.opportunity.contact_email }}</a></p>
+                {% elif app.opportunity.application_method == 'telegram' and app.opportunity.telegram_contact %}
+                    <p><strong>Verified Telegram application contact:</strong> {{ app.opportunity.telegram_contact }}</p>
+                {% elif app.opportunity.application_method == 'physical' and app.opportunity.physical_address %}
+                    <p><strong>Verified application address:</strong> {{ app.opportunity.physical_address|linebreaksbr }}</p>
+                {% else %}
+                    <p>Existing verified method; see opportunity details for its destination or instructions.</p>
+                {% endif %}
+            {% endif %}
+            {% if not app.opportunity.application_methods and app.opportunity.application_instructions %}
+                <p><strong>Application instructions:</strong> {{ app.opportunity.application_instructions|linebreaksbr }}</p>
+            {% endif %}
+            {% if app.opportunity.status == 'needs_review' %}
+                <p><strong>Opportunity record needs review:</strong> This record is excluded from active listings until reviewed.</p>
+            {% endif %}
+            {% if app.rejection_reason %}<p>{{ app.rejection_reason }}</p>{% elif app.error_message %}<p>{{ app.error_message }}</p>{% endif %}</span><span class="badge {{ app.status }}">{{ app.match_score }}%</span></div>
         {% empty %}<div class="empty">No applications yet.</div>{% endfor %}
     </div>
 </section>

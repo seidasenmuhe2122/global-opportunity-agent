@@ -3,8 +3,7 @@ from __future__ import annotations
 import re
 import os
 import hashlib
-import ipaddress
-import socket
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from django.conf import settings
@@ -13,6 +12,7 @@ from django.core.files.base import ContentFile
 from .document_forms import download_form, fill_pdf, fill_docx
 from .file_storage import local_file_path
 from .account_registration import register_site_account
+from .public_http import public_addresses
 from ..models import ApplicationArtifact
 
 
@@ -41,26 +41,11 @@ def _domain(url):
 
 
 def _safe_navigation_url(url):
-    parsed = urlsplit(url or '')
-    if (
-        parsed.scheme not in {'http', 'https'}
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.hostname.lower().endswith(('.localhost', '.local'))
-    ):
-        return False
     try:
-        addresses = socket.getaddrinfo(
-            parsed.hostname,
-            parsed.port or (443 if parsed.scheme == 'https' else 80),
-        )
-    except OSError:
+        public_addresses(url)
+    except ValueError:
         return False
-    return bool(addresses) and all(
-        ipaddress.ip_address(address[4][0]).is_global
-        for address in addresses
-    )
+    return True
 
 
 def _state_url(url):
@@ -92,9 +77,21 @@ def _state_url(url):
 
 def _safe_error_text(value):
     message = str(value or '')[:4000]
-    return re.sub(
+    for name, secret in os.environ.items():
+        upper_name = name.upper()
+        if secret and len(secret) >= 6 and any(
+            marker in upper_name
+            for marker in ('PASSWORD', 'SECRET', 'TOKEN', 'API_KEY', 'AUTH', 'BOT')
+        ):
+            message = message.replace(secret, '[redacted]')
+    message = re.sub(
         r'(?i)([?&](?:token|access_token|refresh_token|auth|code|state|session|key|ticket|password)=)[^&\s]+',
         r'\1[redacted]',
+        message,
+    )
+    return re.sub(
+        r'(?i)\b(password|passwd|secret|token|api[_-]?key)\s*([:=]\s*)[^\s,;]+',
+        r'\1\2[redacted]',
         message,
     )
 
@@ -571,6 +568,30 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
         ])
         return False
 
+    def _workflow_remaining_seconds(self, state):
+        started_at = state.get('workflow_started_at')
+        if not started_at:
+            state['workflow_started_at'] = timezone.now().isoformat()
+            return float(settings.APPLICATION_WORKFLOW_BUDGET_SECONDS)
+        try:
+            started_at = datetime.fromisoformat(started_at)
+            if timezone.is_naive(started_at):
+                started_at = timezone.make_aware(started_at)
+        except (TypeError, ValueError):
+            return 0
+        elapsed = (timezone.now() - started_at).total_seconds()
+        if elapsed < 0:
+            return 0
+        state['workflow_elapsed_seconds'] = max(0, int(elapsed))
+        return settings.APPLICATION_WORKFLOW_BUDGET_SECONDS - elapsed
+
+    def _workflow_budget_exceeded(self, state):
+        return self._workflow_remaining_seconds(state) <= 0
+
+    def _workflow_operation_timeout(self, state, maximum_ms):
+        remaining_ms = int(self._workflow_remaining_seconds(state) * 1000)
+        return max(1, min(maximum_ms, remaining_ms))
+
     def _run_dynamic_workflow(self, application, context, browser):
         profile = getattr(application.user, 'profile', None)
         if profile is None:
@@ -586,6 +607,19 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
         state.setdefault('fields_completed', [])
         state.setdefault('required_documents', [])
         state.setdefault('errors', [])
+        if self._workflow_budget_exceeded(state):
+            return self._workflow_result(
+                application,
+                state,
+                'needs_review',
+                'Application workflow time budget expired; manual review is required.',
+            )
+        self._save_workflow(
+            application,
+            state,
+            stage='in_progress',
+            action='workflow_started',
+        )
         entry_url = application.opportunity.application_url
         resume_url = state.get('current_url') if state.get('stage') == 'in_progress' else ''
         login_url = self.credential.login_url if self.credential else ''
@@ -606,7 +640,12 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
 
         def route_request(route):
             request = route.request
-            if request.is_navigation_request() and not _safe_navigation_url(request.url):
+            scheme = urlsplit(request.url).scheme.casefold()
+            if scheme in {'http', 'https'} and not _safe_navigation_url(request.url):
+                blocked_navigation.append(_state_url(request.url))
+                route.abort()
+                return
+            if scheme not in {'http', 'https', 'data', 'blob', 'about'}:
                 blocked_navigation.append(_state_url(request.url))
                 route.abort()
                 return
@@ -614,13 +653,26 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
 
         context.route('**/*', route_request)
         page = context.new_page()
-        page.set_default_timeout(int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)))
+        if self._workflow_budget_exceeded(state):
+            return self._workflow_result(
+                application,
+                state,
+                'needs_review',
+                'Application workflow time budget expired; manual review is required.',
+            )
+        page.set_default_timeout(self._workflow_operation_timeout(
+            state,
+            int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+        ))
         self._save_workflow(application, state, stage='in_progress', page=page, action='open')
         try:
             page.goto(
                 start_url,
                 wait_until='domcontentloaded',
-                timeout=int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+                timeout=self._workflow_operation_timeout(
+                    state,
+                    int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+                ),
             )
         except Exception:
             if blocked_navigation:
@@ -636,6 +688,14 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
         submission_started = False
 
         while True:
+            if self._workflow_budget_exceeded(state):
+                return self._workflow_result(
+                    application,
+                    state,
+                    'needs_review',
+                    'Application workflow time budget expired; manual review is required.',
+                    page,
+                )
             if blocked_navigation:
                 return self._workflow_result(
                     application,
@@ -703,7 +763,10 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
                 page.goto(
                     entry_url,
                     wait_until='domcontentloaded',
-                    timeout=int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+                    timeout=self._workflow_operation_timeout(
+                        state,
+                        int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+                    ),
                 )
                 login_entry = False
                 continue
@@ -754,13 +817,27 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
                     page=page,
                     action='sign_in',
                 )
+                if self._workflow_budget_exceeded(state):
+                    return self._workflow_result(
+                        application,
+                        state,
+                        'needs_review',
+                        'Application workflow time budget expired; manual review is required.',
+                        page,
+                    )
                 login_action[2].click()
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(min(
+                    500,
+                    self._workflow_operation_timeout(state, 500),
+                ))
                 if login_entry:
                     page.goto(
                         entry_url,
                         wait_until='domcontentloaded',
-                        timeout=int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+                        timeout=self._workflow_operation_timeout(
+                            state,
+                            int(self.config.get('timeout_ms', settings.BROWSER_TIMEOUT_MS)),
+                        ),
                     )
                     login_entry = False
                 continue
@@ -863,6 +940,14 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
                     and page.locator(confirmation_selector).count()
                     and page.locator(confirmation_selector).is_visible()
                 )
+                if self._workflow_budget_exceeded(state):
+                    return self._workflow_result(
+                        application,
+                        state,
+                        'needs_review',
+                        'Application workflow time budget expired; manual review is required.',
+                        page,
+                    )
                 submission_started = True
                 state['submission_started'] = True
                 state['stage'] = 'submitting'
@@ -873,8 +958,22 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
                     page=page,
                     action=label,
                 )
-                locator.click(timeout=10000)
-                page.wait_for_timeout(int(self.config.get('post_submit_wait_ms', 2500)))
+                locator.click(timeout=self._workflow_operation_timeout(state, 10000))
+                page.wait_for_timeout(min(
+                    int(self.config.get('post_submit_wait_ms', 2500)),
+                    self._workflow_operation_timeout(
+                        state,
+                        int(self.config.get('post_submit_wait_ms', 2500)),
+                    ),
+                ))
+                if self._workflow_budget_exceeded(state):
+                    return self._workflow_result(
+                        application,
+                        state,
+                        'needs_review',
+                        'Application workflow exceeded its time budget during submission; manual review is required.',
+                        page,
+                    )
                 if self._security_challenge_present(page):
                     return self._workflow_result(
                         application,
@@ -931,13 +1030,27 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
                 page=page,
                 action=label,
             )
-            locator.click(timeout=10000)
-            page.wait_for_timeout(500)
+            if self._workflow_budget_exceeded(state):
+                return self._workflow_result(
+                    application,
+                    state,
+                    'needs_review',
+                    'Application workflow time budget expired; manual review is required.',
+                    page,
+                )
+            locator.click(timeout=self._workflow_operation_timeout(state, 10000))
+            page.wait_for_timeout(min(
+                500,
+                self._workflow_operation_timeout(state, 500),
+            ))
             pages = context.pages
             if pages and pages[-1] is not page:
                 page = pages[-1]
             if page.url == old_url:
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(min(
+                    500,
+                    self._workflow_operation_timeout(state, 500),
+                ))
             new_fingerprint, _ = self._workflow_fingerprint(page)
             if new_fingerprint == old_fingerprint:
                 return self._workflow_result(
@@ -1032,9 +1145,22 @@ class PlaywrightConfiguredAdapter(ProviderAdapter):
             except Exception:
                 pass
             message = _safe_error_text(exc)
-            application.status = 'needs_review' if submission_started or state.get('submission_started') else 'failed'
+            budget_expired = self._workflow_budget_exceeded(state)
+            if budget_expired:
+                application.status = 'needs_review'
+                message = (
+                    'Application workflow time budget expired; manual review is required. '
+                    + message
+                )
+            else:
+                application.status = (
+                    'needs_review'
+                    if submission_started or state.get('submission_started')
+                    else 'failed'
+                )
             if application.status == 'needs_review':
-                message = 'Submission outcome could not be verified; manual review is required. ' + message
+                if not budget_expired:
+                    message = 'Submission outcome could not be verified; manual review is required. ' + message
             application.error_message = message
             state.setdefault('errors', []).append({
                 'time': timezone.now().isoformat(),

@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from urllib.parse import urljoin, urlsplit
 
-import requests
 from bs4 import BeautifulSoup
-try:
-    import feedparser
-except ImportError:
-    feedparser = None
-
-from django.utils import timezone
 
 from ..models import Opportunity, Source
-from .ai_engine import AIClient
+from .ai_engine import AIClient, AIProviderError
 from .deduplication import deduplicate_and_save_opportunity
 
 UA = 'GlobalOpportunityAgent/2.0 (+public-opportunity-collector)'
 TIMEOUT = 20
-MAX_LINKS = 35
 JOB_WORDS = ('job', 'career', 'vacancy', 'position', 'internship', 'fellowship', 'scholarship', 'grant', 'opportunity', 'apply', 'research')
 
 
@@ -29,25 +20,12 @@ def public_url(url: str) -> bool:
 
 
 def fetch(url: str) -> tuple[str, str]:
-    if not public_url(url):
-        raise ValueError('Only public HTTP/HTTPS source URLs are supported.')
-    from .retries import request_with_exponential_backoff
+    from ..tasks import _validate_public_source_url
+    from .source_ingestion import fetch_public_source
 
-    def request():
-        response = requests.get(
-            url,
-            headers={'User-Agent': UA},
-            timeout=TIMEOUT,
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-        return response
-
-    r = request_with_exponential_backoff(
-        request,
-        description=f'fetching opportunity page {url}',
-    )
-    return r.url, r.text
+    _validate_public_source_url(url)
+    final_url, content, _content_type = fetch_public_source(url, TIMEOUT)
+    return final_url, content
 
 
 def _clean(text: str) -> str:
@@ -67,23 +45,35 @@ def _candidate_links(base: str, html: str) -> list[str]:
         if any(word in hay for word in JOB_WORDS):
             seen.add(href.split('#')[0])
             out.append(href.split('#')[0])
-        if len(out) >= MAX_LINKS:
-            break
     return out
 
 
 def _heuristic_extract(text: str, source_url: str) -> dict:
-    from .source_ingestion import extract_contact_destinations
+    from .source_ingestion import (
+        _application_link_context,
+        _is_application_destination,
+        extract_contact_destinations,
+    )
     from .deadlines import extract_explicit_deadline
 
     lines = [x.strip() for x in re.split(r'[\n\r]+', text) if x.strip()]
     title = next((x for x in lines if 8 <= len(x) <= 180), '')
     app = ''
-    m = re.search(r'https?://[^\s<>"\']+', text, re.I)
-    if m:
-        url = m.group(0).rstrip('.,);')
-        if any(word in url.lower() for word in ('apply', 'application', 'career', 'vacanc', 'jobs')):
-            app = url
+    application_link_pattern = re.compile(
+        r'\b(?:apply(?:\s+now)?|application\s+(?:form|portal)|'
+        r'submit\s+(?:an?\s+)?application|online\s+application)\b',
+        re.I,
+    )
+    for match in re.finditer(r'https?://[^\s<>"\']+', text, re.I):
+        context = _application_link_context(text, match.start())
+        if not application_link_pattern.search(context):
+            continue
+        app = _is_application_destination(
+            match.group(0).rstrip('.,);'),
+            (source_url,),
+        )
+        if app:
+            break
     contacts = extract_contact_destinations(
         {'text': text, 'url': source_url},
         text=text,
@@ -104,7 +94,10 @@ def _heuristic_extract(text: str, source_url: str) -> dict:
 
 
 def _extract_json(client: AIClient, text: str, source_url: str) -> dict:
-    result = client.extract_opportunity(text, source_url=source_url)
+    try:
+        result = client.extract_opportunity(text, source_url=source_url)
+    except AIProviderError:
+        return _heuristic_extract(text, source_url)
     if isinstance(result, dict) and result.get('status') == 'mock':
         return _heuristic_extract(text, source_url)
     if isinstance(result, dict) and 'raw' in result and isinstance(result['raw'], str):
@@ -137,74 +130,19 @@ def _save_opportunity(source: Source, data: dict, raw: str) -> tuple[Opportunity
 
 
 def scan_rss_source(source: Source) -> dict:
-    if feedparser is None:
-        raise RuntimeError('feedparser is not installed.')
-    feed = feedparser.parse(source.url)
-    client = AIClient(); created = 0; updated = 0
-    for entry in feed.entries[:50]:
-        link = entry.get('link') or source.url
-        text = _clean(' '.join([entry.get('title',''), entry.get('summary',''), entry.get('description','')]))
-        if len(text) < 20: continue
-        data = _extract_json(client, text, link)
-        data.setdefault('source_url', link)
-        obj, was_created = _save_opportunity(source, data, text)
-        if obj:
-            created += int(was_created); updated += int(not was_created)
-    return {'source_id': source.pk, 'created': created, 'updated': updated, 'pages': len(feed.entries[:50])}
+    return scan_source(source)
 
 def scan_source(source: Source) -> dict:
-    if source.source_type == 'rss':
-        return scan_rss_source(source)
-    if source.source_type == 'api':
-        final_url, raw = fetch(source.url)
-        try:
-            import json
-            payload = json.loads(raw)
-        except Exception:
-            payload = {}
-        items = payload if isinstance(payload, list) else payload.get('items', payload.get('results', [])) if isinstance(payload, dict) else []
-        created = updated = 0
-        for item in items[:50]:
-            text = json.dumps(item, ensure_ascii=False)
-            data = _extract_json(AIClient(), text, item.get('url', final_url) if isinstance(item, dict) else final_url)
-            obj, was_created = _save_opportunity(source, data, text)
-            if obj: created += int(was_created); updated += int(not was_created)
-        return {'source_id': source.pk, 'created': created, 'updated': updated, 'pages': min(len(items),50)}
-    final_url, html = fetch(source.url)
-    soup = BeautifulSoup(html, 'html.parser')
-    plain = _clean(soup.get_text(' ', strip=True))
-    client = AIClient()
-    created = 0
-    updated = 0
-    processed_urls = []
+    from ..tasks import scan_sources_task
 
-    # Parse the source landing page first.
-    pages = [(final_url, plain)]
-    for link in _candidate_links(final_url, html):
-        try:
-            detail_url, detail_html = fetch(link)
-            detail_text = _clean(BeautifulSoup(detail_html, 'html.parser').get_text(' ', strip=True))
-            if len(detail_text) > 300:
-                pages.append((detail_url, detail_text))
-        except requests.RequestException:
-            continue
-
-    for page_url, text in pages[:MAX_LINKS + 1]:
-        try:
-            data = _extract_json(client, text, page_url)
-            if not data.get('is_opportunity', True) and not data.get('is_job', True):
-                continue
-            data.setdefault('source_url', page_url)
-            data.setdefault('application_url', page_url if 'apply' in page_url.lower() else '')
-            obj, was_created = _save_opportunity(source, data, text)
-            if obj:
-                processed_urls.append(page_url)
-                if was_created:
-                    created += 1
-                else:
-                    updated += 1
-        except Exception:
-            # One bad page must not stop the entire source.
-            continue
-
-    return {'source_id': source.pk, 'created': created, 'updated': updated, 'pages': len(processed_urls)}
+    if not source.pk:
+        raise ValueError('Source must be saved before it can be scanned.')
+    result = scan_sources_task.run(limit=1, source_ids=[source.pk])
+    return {
+        'source_id': source.pk,
+        'created': result['new_opportunities'],
+        'updated': result['updated_opportunities'],
+        'pages': result['pages_processed'],
+        'errors': result['errors'],
+        'candidate_errors': result['candidate_errors'],
+    }

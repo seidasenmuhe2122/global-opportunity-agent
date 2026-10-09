@@ -6,6 +6,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from ..models import Application, ApplicationAttempt
+from .source_ingestion import is_listing_opportunity
 from .matching import compute_match_score
 
 logger = logging.getLogger(__name__)
@@ -163,24 +164,71 @@ class ApplicationGuard:
 
         if opportunity.status != 'active':
             return False, 'Opportunity is no longer active.'
+        if is_listing_opportunity(opportunity):
+            return False, 'Opportunity source is a listing page and is not publishable.'
         if opportunity.is_expired():
             return False, 'Opportunity deadline has passed.'
         if not opportunity.application_url:
-            contacts = [
-                f'{label}: {value}'
-                for label, value in (
-                    ('email', opportunity.contact_email),
-                    ('Telegram', opportunity.telegram_contact),
-                    ('phone', opportunity.contact_phone),
-                    ('physical address', opportunity.physical_address),
-                )
-                if value
-            ]
-            if contacts:
+            verified_routes = (
+                opportunity.application_methods
+                if isinstance(opportunity.application_methods, list)
+                else []
+            )
+            if opportunity.application_method == 'form' and opportunity.application_form_url:
                 return False, (
-                    'MANUAL_CONTACT_REQUIRED: No verified online application URL was found. '
-                    + '; '.join(contacts)
-                    + '. Follow the preserved application instructions in the opportunity details.'
+                    'MANUAL_APPLICATION_FORM_REQUIRED: A verified application form is available at '
+                    f'{opportunity.application_form_url}; complete and submit it manually.'
+                )
+            application_contact = {
+                'email': ('email', opportunity.contact_email),
+                'telegram': ('Telegram', opportunity.telegram_contact),
+                'physical': ('physical address', opportunity.physical_address),
+                'phone': ('phone application contact', opportunity.contact_phone),
+            }.get(opportunity.application_method)
+            route = next(
+                (
+                    item for item in verified_routes
+                    if isinstance(item, dict)
+                    and item.get('method') == opportunity.application_method
+                    and item.get('destination')
+                ),
+                None,
+            )
+            if route:
+                label = str(route.get('method') or 'application contact')
+                destination = str(route.get('destination') or '')
+                instructions = str(route.get('instructions') or '').strip()
+                return False, (
+                    'MANUAL_CONTACT_REQUIRED: No verified online application URL was found; '
+                    f'use the verified application {label} ({destination}). '
+                    f'{instructions}'.strip()
+                )
+            if application_contact and application_contact[1]:
+                return False, (
+                    'MANUAL_CONTACT_REQUIRED: No verified online application URL was found; '
+                    f'use the verified application {application_contact[0]} '
+                    f'({application_contact[1]}) and follow the preserved application instructions.'
+                )
+            if opportunity.application_method == 'source_only':
+                phone_route = next(
+                    (
+                        item for item in verified_routes
+                        if isinstance(item, dict)
+                        and item.get('method') == 'phone'
+                        and item.get('destination')
+                    ),
+                    None,
+                )
+                if phone_route:
+                    return False, (
+                        'APPLICATION_METHOD_UNVERIFIED: The source explicitly provides '
+                        'a phone application route, but phone is not a supported primary '
+                        f'application method. Review the instructions: '
+                        f'{phone_route.get("instructions") or phone_route["destination"]}'
+                    )
+                return False, (
+                    'APPLICATION_METHOD_UNVERIFIED: The source page contains no verified '
+                    'application destination or application-specific contact method.'
                 )
             return False, 'Application destination URL is missing.'
         if application.status == 'submitted' or Application.objects.filter(

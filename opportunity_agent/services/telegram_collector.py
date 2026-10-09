@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from .source_ingestion import _contact
 
 
-async def collect_public_channel(source, limit=50):
+async def collect_public_channel(source, limit=50, min_message_id=0):
     try:
         from telethon import TelegramClient
     except ImportError: raise RuntimeError('Telethon is not installed.')
@@ -39,7 +39,12 @@ async def collect_public_channel(source, limit=50):
             raise RuntimeError(
                 'Telegram collection requires a pre-authorized session; automated login is not attempted.'
             )
-        async for message in client.iter_messages(channel, limit=limit):
+        async for message in client.iter_messages(
+            channel,
+            limit=limit,
+            min_id=min_message_id,
+            reverse=True,
+        ):
             text = message.message or ''
             link = f'https://t.me/{channel}/{message.id}'
             if text.strip():
@@ -48,6 +53,7 @@ async def collect_public_channel(source, limit=50):
                     'title': text.splitlines()[0][:255],
                     'url': link,
                     'text': text,
+                    'message_id': message.id,
                     'contact_email': email,
                     'contact_phone': phone,
                     'telegram_contact': telegram_contact,

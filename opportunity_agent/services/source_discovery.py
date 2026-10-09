@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import ipaddress
+import json
 import logging
 import os
-import socket
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from django.conf import settings
+from django.db import transaction
+from .public_http import get_public_response, public_addresses
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +19,6 @@ DISCOVERY_KEYWORDS = (
     'grants', 'volunteer', 'study', 'research', 'programs', 'funding', 'training',
     'exchange', 'opportunities',
 )
-MAX_DISCOVERY_CANDIDATES = 20
 MAX_DISCOVERY_PAGE_BYTES = 2_000_000
 ACCESS_BARRIER_TERMS = (
     'verify you are human', 'verify you are a human', 'captcha', 'access denied',
@@ -103,24 +104,9 @@ OPPORTUNITY_KEYWORDS = {
 
 def _public_url(url: str) -> bool:
     try:
-        parsed = urlparse(url)
-        if (
-            parsed.scheme not in {'http', 'https'}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.hostname.lower().endswith(('.localhost', '.local'))
-        ):
-            return False
-        addresses = socket.getaddrinfo(
-            parsed.hostname,
-            parsed.port or (443 if parsed.scheme == 'https' else 80),
-        )
-        return bool(addresses) and all(
-            ipaddress.ip_address(address[4][0]).is_global
-            for address in addresses
-        )
-    except (OSError, ValueError):
+        public_addresses(url)
+        return True
+    except ValueError:
         return False
 
 
@@ -163,18 +149,12 @@ def _trust_score(url: str, text: str, matches: list[str]) -> float:
 
 
 def _fetch_public_page(url: str) -> tuple[str, str]:
-    response = requests.get(
+    response = get_public_response(
         url,
         headers=DISCOVERY_HEADERS,
         timeout=8,
-        allow_redirects=False,
-        stream=True,
     )
     try:
-        status_code = getattr(response, 'status_code', None)
-        if isinstance(status_code, int) and 300 <= status_code < 400:
-            raise ValueError('Discovery candidate redirects; configure its final public URL directly.')
-        response.raise_for_status()
         chunks = []
         total_size = 0
         for chunk in response.iter_content(chunk_size=65536):
@@ -214,7 +194,7 @@ def _inspect_candidate(name: str, url: str) -> dict[str, Any] | None:
 
     matched_keywords = [keyword for keyword in DISCOVERY_KEYWORDS if keyword in searchable]
     opportunity_types = _opportunity_types(searchable)
-    if len(text) < 200 or not matched_keywords or not opportunity_types:
+    if not matched_keywords or not opportunity_types:
         return None
 
     parsed = urlparse(final_url)
@@ -239,39 +219,129 @@ def discover_public_sources(keywords=None) -> list[dict[str, Any]]:
         for value in (keywords or DISCOVERY_KEYWORDS)
         if str(value).strip()
     ]
-    discovered = []
-    seen_urls = set()
+    from ..models import Source, SystemSetting
 
+    discovered = []
+    max_candidates = settings.DISCOVERY_MAX_PER_CYCLE
+    page_size = settings.DISCOVERY_PAGE_SIZE
+    seen_urls = set()
+    state_setting, _ = SystemSetting.objects.get_or_create(
+        key='public_source_discovery_state',
+        defaults={'value': '{}'},
+    )
+    with transaction.atomic():
+        state_setting = SystemSetting.objects.select_for_update().get(
+            pk=state_setting.pk,
+        )
+        try:
+            state = json.loads(state_setting.value or '{}')
+        except (TypeError, json.JSONDecodeError):
+            logger.warning('Invalid public source discovery state; restarting pagination.')
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        seen_urls = set(
+            value for value in state.get('seen_urls', [])
+            if isinstance(value, str)
+        )
+        known_urls = set(Source.objects.values_list('url', flat=True))
+
+    static_candidates_inspected = 0
     for candidate in PUBLIC_SOURCE_CANDIDATES:
-        item = _inspect_candidate(candidate['name'], candidate['url'])
-        if item and item['url'] not in seen_urls:
+        if static_candidates_inspected >= max_candidates:
+            break
+        candidate_url = candidate['url']
+        if candidate_url in known_urls or candidate_url in seen_urls:
+            continue
+        static_candidates_inspected += 1
+        item = _inspect_candidate(candidate['name'], candidate_url)
+        seen_urls.add(candidate_url)
+        if item and item['url'] not in known_urls:
             discovered.append(item)
             seen_urls.add(item['url'])
+            known_urls.add(item['url'])
 
     if os.environ.get('ENABLE_WEB_SOURCE_DISCOVERY', '1').lower() not in {'1', 'true', 'yes'}:
+        state['seen_urls'] = list(seen_urls)[-2000:]
+        state_setting.value = json.dumps(state)
+        state_setting.save(update_fields=['value', 'updated_at'])
         return discovered
 
-    query = ' OR '.join(f'"{term}"' for term in terms[:15])
-    try:
-        response = requests.get(
-            'https://html.duckduckgo.com/html/',
-            params={'q': query},
-            headers={'User-Agent': 'GlobalOpportunityAgent/1.0'},
-            timeout=12,
-        )
-        response.raise_for_status()
-    except requests.RequestException:
-        logger.exception('Optional public source search failed.')
+    groups = [
+        terms[index:index + 3]
+        for index in range(0, len(terms), 3)
+    ]
+    if not groups:
+        state['seen_urls'] = list(seen_urls)[-2000:]
+        state_setting.value = json.dumps(state)
+        state_setting.save(update_fields=['value', 'updated_at'])
         return discovered
 
-    soup = BeautifulSoup(response.text, 'html.parser')
-    for anchor in soup.select('.result__a')[:MAX_DISCOVERY_CANDIDATES]:
-        url = anchor.get('href', '')
-        if url in seen_urls or not _public_url(url):
-            continue
-        result = _inspect_candidate(anchor.get_text(' ', strip=True), url)
-        if result:
-            result['notes'] = 'Automatically discovered from public search and verified public page.'
-            discovered.append(result)
-            seen_urls.add(result['url'])
+    query_index = state.get('query_index', 0)
+    if not isinstance(query_index, int) or isinstance(query_index, bool):
+        query_index = 0
+    query_index %= len(groups)
+    offsets = state.get('offsets', {})
+    if not isinstance(offsets, dict):
+        offsets = {}
+
+    remaining_candidates = max_candidates - static_candidates_inspected
+    max_queries = min(len(groups), remaining_candidates)
+    search_candidates = 0
+    for _ in range(max_queries):
+        group = groups[query_index]
+        query = ' OR '.join(f'"{term}"' for term in group)
+        offset = offsets.get(str(query_index), 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            offset = 0
+        try:
+            response = get_public_response(
+                'https://html.duckduckgo.com/html/',
+                headers={'User-Agent': 'GlobalOpportunityAgent/1.0'},
+                timeout=12,
+                params={'q': query, 's': offset},
+            )
+            try:
+                soup = BeautifulSoup(response.text, 'html.parser')
+            finally:
+                response.close()
+            anchors = soup.select('.result__a')[:page_size]
+            consumed_anchors = 0
+            for anchor in anchors:
+                if search_candidates >= remaining_candidates:
+                    break
+                url = anchor.get('href', '')
+                consumed_anchors += 1
+                search_candidates += 1
+                if not url or url in known_urls or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                if not _public_url(url):
+                    continue
+                result = _inspect_candidate(anchor.get_text(' ', strip=True), url)
+                if result and result['url'] not in known_urls:
+                    result['notes'] = 'Automatically discovered from public search and verified public page.'
+                    discovered.append(result)
+                    known_urls.add(result['url'])
+                    seen_urls.add(result['url'])
+            cap_reached_inside_page = consumed_anchors < len(anchors)
+            if cap_reached_inside_page or len(anchors) >= page_size:
+                offsets[str(query_index)] = offset + consumed_anchors
+            else:
+                offsets[str(query_index)] = 0
+        except (requests.RequestException, ValueError, OSError) as exc:
+            logger.warning(
+                'Public source discovery query %s failed; continuing to the next query: %s',
+                query_index,
+                type(exc).__name__,
+            )
+        query_index = (query_index + 1) % len(groups)
+        if search_candidates >= remaining_candidates:
+            break
+
+    state['query_index'] = query_index
+    state['offsets'] = offsets
+    state['seen_urls'] = list(seen_urls)[-2000:]
+    state_setting.value = json.dumps(state)
+    state_setting.save(update_fields=['value', 'updated_at'])
     return discovered

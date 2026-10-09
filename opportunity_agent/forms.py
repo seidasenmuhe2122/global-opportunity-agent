@@ -99,6 +99,12 @@ class SanitizedFormMixin:
 
 
 class UserProfileForm(CVUploadValidationMixin, SanitizedFormMixin, forms.ModelForm):
+    skills = CommaSeparatedListField(
+        required=False,
+        label='Skills and career interests',
+        help_text='Include skills, job titles, and career interests (for example: Python, software development, management, project coordination).',
+        widget=forms.Textarea(attrs={'rows': 3}),
+    )
     cv = forms.FileField(
         required=False,
         widget=PrivateProfileFileInput(attrs={'accept': '.pdf,.docx'}),
