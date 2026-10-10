@@ -145,6 +145,155 @@ class ServerErrorLoggingTests(SimpleTestCase):
         self.assertIn('diagnostic logging regression test', captured.output[0])
 
 
+class ApplicationRouteSmokeTests(TestCase):
+    def setUp(self):
+        call_command('setup_roles')
+        self.user = User.objects.create_user(
+            username='route-smoke-user',
+            email='route-smoke@example.com',
+            password='StrongPass123!',
+        )
+        self.user.groups.add(Group.objects.get(name='USER'))
+        self.opportunity = Opportunity.objects.create(
+            title='Route smoke opportunity',
+            description='A safe local opportunity fixture for route smoke tests.',
+            dedupe_hash='route-smoke-opportunity',
+        )
+
+    def tearDown(self):
+        cache.clear()
+        super().tearDown()
+
+    def test_public_get_routes_render_or_return_the_expected_status(self):
+        routes = {
+            'home': 200,
+            'private_access': 200,
+            'private_access_token': 200,
+            'robots_txt': 200,
+            'sitemap': 200,
+            'opportunity_list': 200,
+            'opportunity_detail': 200,
+            'signup': 200,
+            'signup_legacy': 200,
+            'login': 200,
+            'login_legacy': 200,
+            'website_visibility_toggle': 403,
+            'registration_mode_toggle': 403,
+            'admin_dashboard': 403,
+            'analytics_dashboard': 403,
+        }
+        kwargs_by_route = {
+            'private_access_token': {'token': 'invalid-smoke-token'},
+            'opportunity_detail': {'pk': self.opportunity.pk},
+        }
+
+        for route_name, expected_status in routes.items():
+            with self.subTest(route=route_name):
+                response = self.client.get(
+                    reverse(route_name, kwargs=kwargs_by_route.get(route_name)),
+                )
+                self.assertEqual(response.status_code, expected_status)
+
+    def test_authenticated_get_routes_render_or_redirect_as_expected(self):
+        self.client.force_login(self.user)
+        routes = {
+            'dashboard': 200,
+            'assistant': 200,
+            'assistant_new': 302,
+            'opportunity_list': 200,
+            'opportunity_detail': 200,
+            'profile': 200,
+            'credentials': 200,
+            'profile_cv_download': 404,
+            'opportunity_saved': 405,
+            'opportunity_apply': 302,
+            'logout': 405,
+            'logout_legacy': 405,
+            'ai_chat_send': 405,
+        }
+        kwargs_by_route = {
+            'opportunity_detail': {'pk': self.opportunity.pk},
+            'profile_cv_download': {'user_id': self.user.pk},
+            'opportunity_saved': {'pk': self.opportunity.pk},
+            'opportunity_apply': {'pk': self.opportunity.pk},
+            'ai_chat_send': {'conversation_id': 1},
+        }
+        paths = {
+            'dashboard': 'user_dashboard',
+            'assistant': 'ai_chat',
+            'assistant_new': 'ai_chat_new',
+            'opportunity_list': 'opportunity_list',
+            'opportunity_detail': 'opportunity_detail',
+            'profile': 'profile_edit',
+            'credentials': 'credentials',
+            'profile_cv_download': 'profile_cv_download',
+            'opportunity_saved': 'toggle_saved_opportunity',
+            'opportunity_apply': 'apply_opportunity',
+            'logout': 'logout',
+            'logout_legacy': 'logout_legacy',
+            'ai_chat_send': 'ai_chat_send',
+        }
+
+        for label, expected_status in routes.items():
+            with self.subTest(route=label):
+                response = self.client.get(
+                    reverse(paths[label], kwargs=kwargs_by_route.get(label)),
+                )
+                self.assertEqual(response.status_code, expected_status)
+
+    def test_superuser_dashboard_and_registered_admin_changelists_render(self):
+        for model in admin.site._registry:
+            model_route = (
+                f'admin:{model._meta.app_label}_{model._meta.model_name}'
+            )
+            object_routes = (
+                ('changelist', {}),
+                ('add', {}),
+                ('history', {'object_id': '1'}),
+                ('delete', {'object_id': '1'}),
+                ('change', {'object_id': '1'}),
+            )
+            for suffix, kwargs in object_routes:
+                route_name = f'{model_route}_{suffix}'
+                with self.subTest(anonymous_admin_route=route_name):
+                    response = self.client.get(reverse(route_name, kwargs=kwargs))
+                    self.assertEqual(response.status_code, 302)
+
+        admin_user = User.objects.create_superuser(
+            username='route-smoke-admin',
+            email='route-smoke-admin@example.com',
+            password='StrongPass123!',
+        )
+        self.client.force_login(admin_user)
+
+        for route_name in (
+            'admin:index',
+            'admin:app_list',
+            'admin:opportunity_agent_source_import_csv',
+            'admin:opportunity_agent_privateaccesstoken_issue_link',
+            'admin_dashboard',
+            'analytics_dashboard',
+        ):
+            with self.subTest(route=route_name):
+                kwargs = (
+                    {'app_label': 'opportunity_agent'}
+                    if route_name == 'admin:app_list'
+                    else None
+                )
+                self.assertEqual(
+                    self.client.get(reverse(route_name, kwargs=kwargs)).status_code,
+                    200,
+                )
+
+        for model in admin.site._registry:
+            route_name = (
+                f'admin:{model._meta.app_label}_{model._meta.model_name}_changelist'
+            )
+            with self.subTest(admin_model=model._meta.label):
+                response = self.client.get(reverse(route_name))
+                self.assertEqual(response.status_code, 200)
+
+
 def _find_raw_sql_usage(root_dir):
     violations = []
     for path in sorted(root_dir.rglob('*.py')):
