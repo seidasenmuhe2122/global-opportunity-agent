@@ -194,6 +194,28 @@ class ApplicationRouteSmokeTests(TestCase):
                 )
                 self.assertEqual(response.status_code, expected_status)
 
+    def test_protected_get_routes_redirect_anonymous_users_to_login(self):
+        routes = {
+            'user_dashboard': {},
+            'ai_chat': {},
+            'ai_chat_new': {},
+            'ai_chat_send': {'conversation_id': 1},
+            'toggle_saved_opportunity': {'pk': self.opportunity.pk},
+            'apply_opportunity': {'pk': self.opportunity.pk},
+            'profile_edit': {},
+            'profile_cv_download': {'user_id': self.user.pk},
+            'credentials': {},
+        }
+
+        for route_name, kwargs in routes.items():
+            with self.subTest(route=route_name):
+                path = reverse(route_name, kwargs=kwargs or None)
+                response = self.client.get(path)
+                self.assertRedirects(
+                    response,
+                    f'{reverse("login")}?next={quote(path)}',
+                )
+
     def test_authenticated_get_routes_render_or_redirect_as_expected(self):
         self.client.force_login(self.user)
         routes = {
