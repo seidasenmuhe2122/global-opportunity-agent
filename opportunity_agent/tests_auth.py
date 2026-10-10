@@ -1,4 +1,6 @@
 import ast
+import logging
+import sys
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -6,6 +8,7 @@ from urllib.parse import quote, urlparse
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib import admin
 from django.contrib.admin.widgets import FilteredSelectMultiple
+from django.conf import settings
 from django.contrib.auth.models import Group, Permission
 from django.core.cache import cache
 from django.core.management import call_command
@@ -39,6 +42,32 @@ from .services.file_storage import local_file_path
 
 
 User = get_user_model()
+
+
+class ServerErrorLoggingTests(SimpleTestCase):
+    def test_request_errors_log_full_tracebacks_to_stderr(self):
+        logger_config = settings.LOGGING['loggers']['django.request']
+        self.assertEqual(logger_config['level'], 'ERROR')
+        self.assertFalse(logger_config['propagate'])
+
+        handler_config = settings.LOGGING['handlers'][logger_config['handlers'][0]]
+        self.assertEqual(handler_config['class'], 'logging.StreamHandler')
+        self.assertNotIn('stream', handler_config)
+
+        request_logger = logging.getLogger('django.request')
+        self.assertTrue(any(
+            isinstance(handler, logging.StreamHandler)
+            and handler.stream is sys.stderr
+            for handler in request_logger.handlers
+        ))
+        with self.assertLogs(request_logger, level='ERROR') as captured:
+            try:
+                raise RuntimeError('diagnostic logging regression test')
+            except RuntimeError:
+                request_logger.exception('Request failed')
+
+        self.assertIn('Traceback (most recent call last)', captured.output[0])
+        self.assertIn('diagnostic logging regression test', captured.output[0])
 
 
 def _find_raw_sql_usage(root_dir):

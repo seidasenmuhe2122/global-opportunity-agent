@@ -166,6 +166,23 @@ RATE_LIMIT_RULES = {
     'assistant': {'limit': 30, 'window': 60, 'methods': {'POST'}, 'paths': ('/assistant/', '/assistant/new/', '/assistant/conversations/')},
     'private_access': {'limit': 15, 'window': 300, 'methods': {'GET', 'POST'}, 'paths': ('/private-access/',)},
 }
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'request_errors': {
+            'class': 'logging.StreamHandler',
+            'level': 'ERROR',
+        },
+    },
+    'loggers': {
+        'django.request': {
+            'handlers': ['request_errors'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+    },
+}
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_REFERRER_POLICY = 'same-origin'
