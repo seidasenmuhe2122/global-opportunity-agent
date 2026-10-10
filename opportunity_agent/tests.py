@@ -5100,6 +5100,26 @@ class OpportunityAgentTestCase(TestCase):
         self.assertIn('opportunity_agent.tasks.expire_deadlines_task', scheduled_tasks)
         self.assertIn('opportunity_agent.tasks.process_application_queue_task', scheduled_tasks)
         self.assertIn('opportunity_agent.tasks.health_check_task', scheduled_tasks)
+        schedule_by_task = {
+            entry['task']: entry['schedule']
+            for entry in schedule.values()
+        }
+        self.assertEqual(
+            schedule_by_task['opportunity_agent.tasks.automation_cycle_task'],
+            15 * 60,
+        )
+        self.assertEqual(
+            schedule_by_task['opportunity_agent.tasks.discover_sources_task'],
+            6 * 60 * 60,
+        )
+        self.assertEqual(
+            schedule_by_task['opportunity_agent.tasks.expire_deadlines_task'],
+            60 * 60,
+        )
+        self.assertEqual(
+            schedule_by_task['opportunity_agent.tasks.process_application_queue_task'],
+            5 * 60,
+        )
 
     def test_user_dashboard_renders_application_and_opportunity_metrics(self):
         from datetime import timedelta
@@ -5517,6 +5537,36 @@ class OpportunityAgentTestCase(TestCase):
         request.user.is_staff = True
         request.resolver_match = SimpleNamespace(url_name='opportunity_agent_application_changelist')
         self.assertEqual(admin_metrics(request), {})
+
+    def test_admin_metrics_mark_automation_stale_after_two_schedule_intervals(self):
+        from django.test import RequestFactory
+        from django.utils import timezone
+        from .context_processors import admin_metrics
+
+        request = RequestFactory().get('/admin/')
+        request.user = self.user
+        request.user.is_staff = True
+        request.resolver_match = SimpleNamespace(url_name='index')
+
+        for status in ('success', 'running'):
+            with self.subTest(status=status):
+                AutomationRun.objects.all().delete()
+                run = AutomationRun.objects.create(status=status)
+                AutomationRun.objects.filter(pk=run.pk).update(
+                    started_at=timezone.now() - timedelta(minutes=31),
+                )
+
+                metrics = admin_metrics(request)['admin_metrics']
+
+                self.assertEqual(metrics['automation_status'], 'Stale')
+
+        self.user.is_staff = True
+        self.user.is_superuser = True
+        self.user.save(update_fields=['is_staff', 'is_superuser'])
+        self.client.force_login(self.user)
+        response = self.client.get('/admin/')
+        self.assertContains(response, 'oa-status-alert')
+        self.assertContains(response, 'no cycle started in the last 30 minutes')
 
     def test_admin_dashboard_is_available_to_admin_group(self):
         self.user.is_staff = True

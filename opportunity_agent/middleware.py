@@ -6,11 +6,10 @@ from urllib.parse import quote
 
 from django.conf import settings
 from django.core.cache import cache
+from django.db import OperationalError
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect
 from django.utils import timezone
-from redis.exceptions import RedisError
-
 from .models import get_website_visibility
 
 
@@ -21,6 +20,7 @@ DEFAULT_RATE_LIMIT_RULES = {
     'login': {'limit': 20, 'window': 300, 'methods': {'POST'}, 'paths': ('/accounts/login/', '/login/')},
     'signup': {'limit': 20, 'window': 900, 'methods': {'POST'}, 'paths': ('/accounts/signup/', '/signup/')},
     'profile': {'limit': 30, 'window': 300, 'methods': {'POST'}, 'paths': ('/profile/', '/credentials/', '/website-visibility/')},
+    'application': {'limit': 10, 'window': 300, 'methods': {'POST'}, 'paths': ('/opportunities/',)},
     'search': {'limit': 60, 'window': 60, 'methods': {'GET'}, 'paths': ('/opportunities/',)},
     'assistant': {'limit': 30, 'window': 60, 'methods': {'POST'}, 'paths': ('/assistant/', '/assistant/new/', '/assistant/conversations/')},
     'private_access': {'limit': 15, 'window': 300, 'methods': {'GET', 'POST'}, 'paths': ('/private-access/',)},
@@ -92,10 +92,11 @@ class SensitiveEndpointRateLimitMiddleware:
                             count = 1
                         else:
                             count = cache.incr(bucket)
-            except (RedisError, ValueError):
-                logger.exception(
-                    'Redis-backed rate limiting failed for rule %s; rejecting request.',
+            except Exception as exc:
+                logger.error(
+                    'Redis-backed rate limiting failed for rule %s (%s); rejecting request.',
                     rule_name,
+                    type(exc).__name__,
                 )
                 return self._cache_unavailable_response(request, window)
             if count > limit:
@@ -133,7 +134,28 @@ class PrivateModeMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        visibility = get_website_visibility()
+        try:
+            visibility = get_website_visibility()
+        except OperationalError as exc:
+            logger.error(
+                'Website visibility lookup failed due to a database error (%s); rejecting request.',
+                type(exc).__name__,
+            )
+            request.website_visibility = 'private'
+            return HttpResponse(
+                'Website availability could not be verified. Please retry shortly.',
+                status=503,
+            )
+        except Exception as exc:
+            logger.error(
+                'Website visibility lookup failed unexpectedly (%s); rejecting request.',
+                type(exc).__name__,
+            )
+            request.website_visibility = 'private'
+            return HttpResponse(
+                'Website availability could not be verified. Please retry shortly.',
+                status=503,
+            )
         request.website_visibility = visibility
         if visibility != 'private':
             return self.get_response(request)

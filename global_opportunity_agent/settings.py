@@ -1,3 +1,4 @@
+import ipaddress
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -86,9 +87,23 @@ if not DEBUG and not DATABASE_URL:
 if DATABASE_URL:
     import dj_database_url
 
-    DATABASES = {'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600, ssl_require=not DEBUG)}
+    DATABASES = {
+        'default': dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=60,
+            conn_health_checks=True,
+            ssl_require=not DEBUG,
+        )
+    }
 else:
-    DATABASES = {'default': {'ENGINE':'django.db.backends.sqlite3','NAME':BASE_DIR/'db.sqlite3'}}
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+            'CONN_MAX_AGE': 60,
+            'CONN_HEALTH_CHECKS': True,
+        }
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -148,12 +163,37 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
 def _validated_redis_url(name, value):
+    value = (value or '').strip()
     supported_schemes = ('redis', 'rediss')
     try:
         parsed = urlsplit(value)
-        valid_address = bool(parsed.hostname)
+        host = parsed.hostname
+        valid_address = bool(host) and not any(character.isspace() for character in host)
         if valid_address:
-            parsed.port
+            port = parsed.port
+            valid_address = (
+                port is None or 1 <= port <= 65535
+            ) and (
+                not parsed.path
+                or parsed.path == '/'
+                or parsed.path[1:].isdigit()
+            ) and not parsed.fragment
+            if not DEBUG:
+                try:
+                    address = ipaddress.ip_address(host)
+                except ValueError:
+                    address = None
+                if host.lower() == 'localhost' or (address is not None and (
+                    address.is_loopback
+                    or address.is_private
+                    or address.is_link_local
+                    or address.is_multicast
+                    or address.is_reserved
+                    or address.is_unspecified
+                )):
+                    raise ImproperlyConfigured(
+                        f'{name} must point to a public Redis service in production.'
+                    )
     except ValueError:
         valid_address = False
         parsed = None
@@ -165,16 +205,25 @@ def _validated_redis_url(name, value):
         raise ImproperlyConfigured(
             f'{name} must be a valid Redis URL using redis:// or rediss://.'
         )
-    return value
+    return parsed._replace(scheme=parsed.scheme.lower()).geturl()
 
 
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0').strip()
-if not DEBUG and not REDIS_URL:
-    raise ImproperlyConfigured(
-        'Set REDIS_URL to a valid Redis URL using redis:// or rediss://.'
-    )
-if REDIS_URL:
-    REDIS_URL = _validated_redis_url('REDIS_URL', REDIS_URL)
+def _redis_url_from_environment(name, value, *, default=None):
+    value = (value or '').strip()
+    if not value:
+        if default is None:
+            raise ImproperlyConfigured(
+                f'Set {name} to a valid Redis URL using redis:// or rediss://.'
+            )
+        value = default
+    return _validated_redis_url(name, value)
+
+
+REDIS_URL = _redis_url_from_environment(
+    'REDIS_URL',
+    os.environ.get('REDIS_URL'),
+    default='redis://localhost:6379/0' if DEBUG else None,
+)
 
 CACHES = {
     'default': {
@@ -194,6 +243,7 @@ RATE_LIMIT_RULES = {
     'login': {'limit': 20, 'window': 300, 'methods': {'POST'}, 'paths': ('/accounts/login/', '/login/')},
     'signup': {'limit': 20, 'window': 900, 'methods': {'POST'}, 'paths': ('/accounts/signup/', '/signup/')},
     'profile': {'limit': 30, 'window': 300, 'methods': {'POST'}, 'paths': ('/profile/', '/credentials/', '/website-visibility/')},
+    'application': {'limit': 10, 'window': 300, 'methods': {'POST'}, 'paths': ('/opportunities/',)},
     'search': {'limit': 60, 'window': 60, 'methods': {'GET'}, 'paths': ('/opportunities/',)},
     'assistant': {'limit': 30, 'window': 60, 'methods': {'POST'}, 'paths': ('/assistant/', '/assistant/new/', '/assistant/conversations/')},
     'private_access': {'limit': 15, 'window': 300, 'methods': {'GET', 'POST'}, 'paths': ('/private-access/',)},
@@ -326,22 +376,16 @@ APPLICATION_WORKFLOW_BUDGET_SECONDS = _positive_int_setting(
     'APPLICATION_WORKFLOW_BUDGET_SECONDS', 900, 86400,
 )
 
-CELERY_BROKER_URL = (
-    os.environ.get('CELERY_BROKER_URL', '').strip() or REDIS_URL
+CELERY_BROKER_URL = _redis_url_from_environment(
+    'CELERY_BROKER_URL',
+    os.environ.get('CELERY_BROKER_URL'),
+    default=REDIS_URL,
 )
-CELERY_RESULT_BACKEND = (
-    os.environ.get('CELERY_RESULT_BACKEND', '').strip() or REDIS_URL
+CELERY_RESULT_BACKEND = _redis_url_from_environment(
+    'CELERY_RESULT_BACKEND',
+    os.environ.get('CELERY_RESULT_BACKEND'),
+    default=REDIS_URL,
 )
-if CELERY_BROKER_URL:
-    CELERY_BROKER_URL = _validated_redis_url(
-        'CELERY_BROKER_URL',
-        CELERY_BROKER_URL,
-    )
-if CELERY_RESULT_BACKEND:
-    CELERY_RESULT_BACKEND = _validated_redis_url(
-        'CELERY_RESULT_BACKEND',
-        CELERY_RESULT_BACKEND,
-    )
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'

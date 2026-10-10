@@ -12,6 +12,7 @@ from django.conf import settings
 from django.contrib.auth.models import Group, Permission
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
+from django.db import OperationalError
 from django.core.management import call_command
 from django.http import HttpResponse
 from django.test import Client, RequestFactory, SimpleTestCase, TestCase, override_settings
@@ -42,8 +43,11 @@ from .models import (
 from .services.credential_vault import decrypt_secret, encrypt_secret
 from .services.file_storage import local_file_path
 
-from global_opportunity_agent.settings import _validated_redis_url
-from .middleware import SensitiveEndpointRateLimitMiddleware
+from global_opportunity_agent.settings import (
+    _redis_url_from_environment,
+    _validated_redis_url,
+)
+from .middleware import PrivateModeMiddleware, SensitiveEndpointRateLimitMiddleware
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 
@@ -51,13 +55,58 @@ User = get_user_model()
 
 
 class RedisConfigurationTests(SimpleTestCase):
+    def test_database_connections_use_health_checks_and_a_60_second_lifetime(self):
+        database = settings.DATABASES['default']
+
+        self.assertEqual(database['CONN_MAX_AGE'], 60)
+        self.assertTrue(database['CONN_HEALTH_CHECKS'])
+
+    def test_production_redis_url_cannot_be_missing_or_blank(self):
+        for value in (None, '', '   '):
+            with self.subTest(value='blank' if value is not None else 'missing'):
+                with self.assertRaisesMessage(
+                    ImproperlyConfigured,
+                    'Set REDIS_URL to a valid Redis URL using redis:// or rediss://.',
+                ):
+                    _redis_url_from_environment('REDIS_URL', value)
+
+    def test_development_default_and_celery_shared_redis_fallback(self):
+        local_redis_url = 'redis://localhost:6379/0'
+        self.assertEqual(
+            _redis_url_from_environment(
+                'REDIS_URL',
+                '',
+                default=local_redis_url,
+            ),
+            local_redis_url,
+        )
+        for name in ('CELERY_BROKER_URL', 'CELERY_RESULT_BACKEND'):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    _redis_url_from_environment(
+                        name,
+                        '  ',
+                        default='rediss://shared-redis.example:6380/0',
+                    ),
+                    'rediss://shared-redis.example:6380/0',
+                )
+
     def test_redis_urls_require_a_supported_scheme_and_host(self):
         self.assertEqual(
-            _validated_redis_url('REDIS_URL', 'rediss://cache.example:6380/0'),
+            _validated_redis_url('REDIS_URL', '  rediss://cache.example:6380/0  '),
             'rediss://cache.example:6380/0',
         )
 
-        for value in ('cache.example:6379', 'http://cache.example:6379', 'redis://'):
+        for value in (
+            'cache.example:6379',
+            'http://cache.example:6379',
+            'redis://',
+            'redis://bad host:6379/0',
+            'redis://cache.example:bad-port',
+            'redis://cache.example/invalid-db',
+            'redis://cache.example:70000/0',
+            'redis://cache.example/0#fragment',
+        ):
             with self.subTest(value=value):
                 with self.assertRaisesMessage(
                     ImproperlyConfigured,
@@ -65,21 +114,40 @@ class RedisConfigurationTests(SimpleTestCase):
                 ):
                     _validated_redis_url('REDIS_URL', value)
 
-    def test_rate_limited_requests_fail_closed_when_redis_is_unavailable(self):
-        rules = {
-            'search': {
-                'limit': 60,
-                'window': 60,
-                'methods': {'GET'},
-                'paths': ('/opportunities/',),
-            },
-            'assistant': {
-                'limit': 30,
-                'window': 60,
-                'methods': {'POST'},
-                'paths': ('/assistant/new/',),
-            },
-        }
+    def test_production_requires_non_local_redis_service(self):
+        with patch('global_opportunity_agent.settings.DEBUG', False):
+            for value in (
+                'redis://localhost:6379/0',
+                'redis://127.0.0.1:6379/0',
+                'rediss://10.0.0.5:6380/0',
+            ):
+                with self.subTest(value=value):
+                    with self.assertRaisesMessage(
+                        ImproperlyConfigured,
+                        'must point to a public Redis service in production.',
+                    ):
+                        _validated_redis_url('REDIS_URL', value)
+
+    def test_optional_celery_overrides_must_be_valid_redis_urls(self):
+        default_url = 'rediss://shared-redis.example:6380/0'
+        for name in ('CELERY_BROKER_URL', 'CELERY_RESULT_BACKEND'):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    _redis_url_from_environment(
+                        name,
+                        'redis://celery-cache.example:6379/1',
+                        default=default_url,
+                    ),
+                    'redis://celery-cache.example:6379/1',
+                )
+                with self.assertRaises(ImproperlyConfigured):
+                    _redis_url_from_environment(
+                        name,
+                        'http://celery-cache.example:6379',
+                        default=default_url,
+                    )
+
+    def test_rate_limited_routes_fail_closed_on_cache_configuration_and_connection_errors(self):
         middleware = SensitiveEndpointRateLimitMiddleware(
             lambda request: HttpResponse('view reached'),
         )
@@ -87,36 +155,160 @@ class RedisConfigurationTests(SimpleTestCase):
         cache_failures = (
             RedisConnectionError('connection refused'),
             ValueError('Redis URL must specify a supported scheme'),
+            ImproperlyConfigured('cache backend is not configured'),
+            RuntimeError('cache backend unavailable'),
         )
-        with override_settings(RATE_LIMIT_RULES=rules):
-            for method, path in (
-                ('get', '/opportunities/'),
-                ('post', '/assistant/new/'),
-            ):
-                for cache_failure in cache_failures:
-                    with self.subTest(path=path, error=type(cache_failure).__name__):
-                        request = getattr(RequestFactory(), method)(path)
-                        with patch(
-                            'opportunity_agent.middleware.cache.add',
-                            side_effect=cache_failure,
-                        ):
-                            with self.assertLogs(
-                                'opportunity_agent.middleware',
-                                level='ERROR',
-                            ) as captured:
-                                response = middleware(request)
+        for method, path in (
+            ('get', '/opportunities/'),
+            ('post', '/opportunities/1/apply/'),
+            ('post', '/assistant/new/'),
+        ):
+            for cache_failure in cache_failures:
+                with self.subTest(path=path, error=type(cache_failure).__name__):
+                    request = getattr(RequestFactory(), method)(path)
+                    with patch(
+                        'opportunity_agent.middleware.cache.add',
+                        side_effect=cache_failure,
+                    ):
+                        with self.assertLogs(
+                            'opportunity_agent.middleware',
+                            level='ERROR',
+                        ) as captured:
+                            response = middleware(request)
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(response.status_code, 503)
+                    self.assertNotContains(
+                        response,
+                        str(cache_failure),
+                        status_code=503,
+                    )
+                    self.assertIn(type(cache_failure).__name__, captured.output[0])
+                    self.assertNotIn(str(cache_failure), captured.output[0])
+                    self.assertNotIn('Traceback', captured.output[0])
 
-                        self.assertEqual(response.status_code, 503)
-                        self.assertNotContains(
-                            response,
-                            str(cache_failure),
-                            status_code=503,
-                        )
-                        self.assertIn(
-                            'Traceback (most recent call last)',
-                            captured.output[0],
-                        )
-                        self.assertIn(str(cache_failure), captured.output[0])
+    def test_rate_limited_routes_fail_closed_when_counter_increment_fails(self):
+        request = RequestFactory().get('/opportunities/')
+        middleware = SensitiveEndpointRateLimitMiddleware(
+            lambda current_request: HttpResponse('view reached'),
+        )
+
+        with (
+            patch('opportunity_agent.middleware.cache.add', return_value=False),
+            patch(
+                'opportunity_agent.middleware.cache.incr',
+                side_effect=RedisConnectionError('connection refused'),
+            ),
+            self.assertLogs('opportunity_agent.middleware', level='ERROR'),
+        ):
+            response = middleware(request)
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_rate_limited_routes_fail_closed_when_cache_key_recovery_fails(self):
+        request = RequestFactory().get('/opportunities/')
+        middleware = SensitiveEndpointRateLimitMiddleware(
+            lambda current_request: HttpResponse('view reached'),
+        )
+
+        with (
+            patch(
+                'opportunity_agent.middleware.cache.add',
+                side_effect=(False, RedisConnectionError('connection refused')),
+            ) as cache_add,
+            patch(
+                'opportunity_agent.middleware.cache.incr',
+                side_effect=ValueError('cache key disappeared'),
+            ) as cache_incr,
+            self.assertLogs('opportunity_agent.middleware', level='ERROR'),
+        ):
+            response = middleware(request)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(cache_add.call_count, 2)
+        cache_incr.assert_called_once()
+
+    def test_cache_failure_does_not_block_unrelated_public_route(self):
+        request = RequestFactory().get('/')
+        middleware = SensitiveEndpointRateLimitMiddleware(
+            lambda current_request: HttpResponse('home page', status=200),
+        )
+
+        with patch(
+            'opportunity_agent.middleware.cache.add',
+            side_effect=RedisConnectionError('connection refused'),
+        ) as cache_add:
+            response = middleware(request)
+
+        self.assertEqual(response.status_code, 200)
+        cache_add.assert_not_called()
+
+    def test_cache_and_counter_failures_do_not_affect_unrelated_public_routes(self):
+        request = RequestFactory().get('/')
+        middleware = SensitiveEndpointRateLimitMiddleware(
+            lambda current_request: HttpResponse('home page', status=200),
+        )
+
+        with (
+            patch(
+                'opportunity_agent.middleware.cache.add',
+                side_effect=RedisConnectionError('connection refused'),
+            ) as cache_add,
+            patch(
+                'opportunity_agent.middleware.cache.incr',
+                side_effect=RedisConnectionError('connection refused'),
+            ) as cache_incr,
+        ):
+            response = middleware(request)
+
+        self.assertEqual(response.status_code, 200)
+        cache_add.assert_not_called()
+        cache_incr.assert_not_called()
+
+    def test_private_mode_fails_closed_when_visibility_database_is_unavailable(self):
+        middleware = PrivateModeMiddleware(
+            lambda request: HttpResponse('view reached'),
+        )
+
+        for failure in (
+            OperationalError('database connection unavailable'),
+            RuntimeError('visibility lookup failed'),
+        ):
+            with self.subTest(error=type(failure).__name__):
+                request = RequestFactory().get('/')
+                with (
+                    patch(
+                        'opportunity_agent.middleware.get_website_visibility',
+                        side_effect=failure,
+                    ),
+                    self.assertLogs('opportunity_agent.middleware', level='ERROR') as captured,
+                ):
+                    response = middleware(request)
+
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(request.website_visibility, 'private')
+                self.assertNotContains(
+                    response,
+                    str(failure),
+                    status_code=503,
+                )
+                self.assertIn(type(failure).__name__, captured.output[0])
+
+    def test_opportunity_list_and_application_routes_return_503_not_500_on_cache_failure(self):
+        client = Client()
+        failure = ValueError('Redis URL must specify a supported scheme')
+
+        for method, path in (
+            ('get', '/opportunities/'),
+            ('post', '/opportunities/1/apply/'),
+        ):
+            with self.subTest(path=path):
+                with patch(
+                    'opportunity_agent.middleware.cache.add',
+                    side_effect=failure,
+                ):
+                    response = getattr(client, method)(path)
+
+                self.assertEqual(response.status_code, 503)
 
 
 class ServerErrorLoggingTests(SimpleTestCase):

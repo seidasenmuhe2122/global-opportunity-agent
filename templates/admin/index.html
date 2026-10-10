@@ -14,6 +14,7 @@
   .oa-panel h2 { margin:0 0 14px; color:#f5f8ff; font-size:19px; }
   .oa-status { display:flex; align-items:center; gap:10px; margin:8px 0 15px; font-size:22px; font-weight:700; }
   .oa-dot { width:10px; height:10px; border-radius:50%; background:#48d597; box-shadow:0 0 12px #48d59788; }
+  .oa-status-alert .oa-dot { background:#ff7777; box-shadow:0 0 12px #ff777788; }
   .oa-detail { display:flex; justify-content:space-between; gap:12px; padding:9px 0; border-top:1px solid #ffffff12; color:#b4c3dc; }
   .oa-detail strong { color:#f4f7fc; text-align:right; }
   .oa-actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:16px; }
@@ -103,7 +104,12 @@
   <div class="oa-layout">
     <section class="oa-panel">
       <h2>Automation</h2>
-      <div class="oa-status"><span class="oa-dot"></span>{{ admin_metrics.automation_status }}</div>
+      <div class="oa-status{% if admin_metrics.automation_status == 'Stale' or admin_metrics.automation_status == 'Failed' %} oa-status-alert{% endif %}">
+        <span class="oa-dot"></span>{{ admin_metrics.automation_status }}
+      </div>
+      {% if admin_metrics.automation_status == 'Stale' %}
+        <p>Expected a cycle every 15 minutes. Check the Render worker and Beat logs; no cycle started in the last 30 minutes.</p>
+      {% endif %}
       <div class="oa-detail">
         <span>Latest cycle</span>
         <strong>

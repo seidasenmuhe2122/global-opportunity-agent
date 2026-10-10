@@ -66,11 +66,12 @@ def admin_metrics(request):
     last_successful_run = AutomationRun.objects.filter(
         status='success',
     ).order_by('-started_at', '-pk').first()
-    running = AutomationRun.objects.filter(status='running').exists()
-    if running:
-        automation_status = 'Running'
-    elif latest_run is None:
+    if latest_run is None:
         automation_status = 'Not run'
+    elif latest_run.started_at < timezone.now() - timedelta(minutes=30):
+        automation_status = 'Stale'
+    elif latest_run.status == 'running':
+        automation_status = 'Running'
     else:
         automation_status = latest_run.get_status_display()
 
