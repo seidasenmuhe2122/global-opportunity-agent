@@ -9,8 +9,8 @@ For Render or another production host use PostgreSQL through `DATABASE_URL`, Red
 | `DATABASE_URL` | PostgreSQL DSN; required in production. |
 | `DJANGO_SECRET_KEY` | Unique Django signing key; required in all environments. |
 | `DEBUG`, `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, `SECURE_SSL_REDIRECT` | Django environment and host/HTTPS security. |
-| `REDIS_URL` | Default Redis endpoint for Celery. Required in production. |
-| `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND` | Optional Redis-compatible Celery endpoint overrides; default to `REDIS_URL`. |
+| `REDIS_URL` | Redis endpoint for production cache, rate limits, and default Celery endpoints. Required in production; must be a valid `redis://` or `rediss://` URL. |
+| `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND` | Optional Redis-compatible Celery endpoint overrides; must use `redis://` or `rediss://` and otherwise default to `REDIS_URL`. |
 | `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`, `AI_PROVIDER`, `AI_TIMEOUT` | OpenAI-compatible AI provider. Provider-specific fallback keys are optional. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS` | Telegram delivery token and admin allow-lists. |
 | `SITE_URL`, `TIME_ZONE` | Canonical site address and scheduling/application timezone. |
@@ -21,7 +21,7 @@ For Render or another production host use PostgreSQL through `DATABASE_URL`, Red
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION` | Optional authorized Telethon session for public Telegram-source collection. |
 
 Celery defaults to JSON-only task/result serialization, one prefetched task per worker process, late acknowledgements, and requeue on worker loss. Beat intervals are defined in `global_opportunity_agent/settings.py`; run exactly one Beat instance per deployment to avoid duplicate scheduled jobs.
-The production cache and sensitive-endpoint rate limits use the Redis URL in `REDIS_URL`, shared by all web workers. Local development falls back to an in-process cache when Redis is not configured.
+The production cache and sensitive-endpoint rate limits use `REDIS_URL`, shared by all web workers. Set it to the private/internal Redis connection URL provided by the hosting provider, including its `redis://` or `rediss://` scheme. The application validates the scheme and host at startup without printing the URL or its credentials. If Redis becomes unavailable after startup, rate-limited requests fail closed with HTTP 503 and the server logs the exception traceback; rate limiting is not bypassed. Local development uses an in-process cache.
 
 Website visibility and registration mode can be changed independently from **Admin Dashboard → Website settings** by a superuser or another account granted `manage_security_settings`. Private visibility enforces access server-side and suppresses the sitemap, indexing directives, and public navigation. Private links are issued and revoked through **Django Admin → Opportunity agent → Private access tokens**; raw links are shown once and stored hashes are not displayed.
 

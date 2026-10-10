@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from django.core.exceptions import ImproperlyConfigured
 try:
@@ -144,16 +145,47 @@ if MEDIA_BUCKET:
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+def _validated_redis_url(name, value):
+    supported_schemes = ('redis', 'rediss')
+    try:
+        parsed = urlsplit(value)
+        valid_address = bool(parsed.hostname)
+        if valid_address:
+            parsed.port
+    except ValueError:
+        valid_address = False
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme.lower() not in supported_schemes
+        or not valid_address
+    ):
+        raise ImproperlyConfigured(
+            f'{name} must be a valid Redis URL using redis:// or rediss://.'
+        )
+    return value
+
+
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0').strip()
+if not DEBUG and not REDIS_URL:
+    raise ImproperlyConfigured(
+        'Set REDIS_URL to a valid Redis URL using redis:// or rediss://.'
+    )
+if REDIS_URL:
+    REDIS_URL = _validated_redis_url('REDIS_URL', REDIS_URL)
+
 CACHES = {
     'default': {
         'BACKEND': (
             'django.core.cache.backends.redis.RedisCache'
-            if not DEBUG and os.environ.get('REDIS_URL', '').strip()
+            if not DEBUG
             else 'django.core.cache.backends.locmem.LocMemCache'
         ),
         'LOCATION': (
-            os.environ.get('REDIS_URL', '').strip()
-            if not DEBUG and os.environ.get('REDIS_URL', '').strip()
+            REDIS_URL
+            if not DEBUG
             else 'opportunity_hub_rate_limits'
         ),
     }
@@ -177,6 +209,11 @@ LOGGING = {
     },
     'loggers': {
         'django.request': {
+            'handlers': ['request_errors'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+        'opportunity_agent.middleware': {
             'handlers': ['request_errors'],
             'level': 'ERROR',
             'propagate': False,
@@ -240,9 +277,6 @@ TELEGRAM_API_HASH = os.environ.get('TELEGRAM_API_HASH', '')
 TELEGRAM_SESSION = os.environ.get('TELEGRAM_SESSION', 'opportunity_hub')
 SITE_URL = os.environ.get('SITE_URL', 'http://localhost:8000')
 CSRF_TRUSTED_ORIGINS = [x.strip() for x in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if x.strip()]
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-if not DEBUG and not os.environ.get('REDIS_URL', '').strip():
-    raise ImproperlyConfigured('Set REDIS_URL for production Celery workers and scheduling.')
 PLAYWRIGHT_STATE_DIR = os.environ.get('PLAYWRIGHT_STATE_DIR', str(BASE_DIR / 'playwright_state'))
 BROWSER_HEADLESS = os.environ.get('BROWSER_HEADLESS', '1').strip().lower() not in {
     '0',
@@ -292,8 +326,22 @@ APPLICATION_WORKFLOW_BUDGET_SECONDS = _positive_int_setting(
     'APPLICATION_WORKFLOW_BUDGET_SECONDS', 900, 86400,
 )
 
-CELERY_BROKER_URL = (os.environ.get('CELERY_BROKER_URL') or REDIS_URL).strip()
-CELERY_RESULT_BACKEND = (os.environ.get('CELERY_RESULT_BACKEND') or REDIS_URL).strip()
+CELERY_BROKER_URL = (
+    os.environ.get('CELERY_BROKER_URL', '').strip() or REDIS_URL
+)
+CELERY_RESULT_BACKEND = (
+    os.environ.get('CELERY_RESULT_BACKEND', '').strip() or REDIS_URL
+)
+if CELERY_BROKER_URL:
+    CELERY_BROKER_URL = _validated_redis_url(
+        'CELERY_BROKER_URL',
+        CELERY_BROKER_URL,
+    )
+if CELERY_RESULT_BACKEND:
+    CELERY_RESULT_BACKEND = _validated_redis_url(
+        'CELERY_RESULT_BACKEND',
+        CELERY_RESULT_BACKEND,
+    )
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'

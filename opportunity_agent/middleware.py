@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from urllib.parse import quote
 
@@ -8,8 +9,12 @@ from django.core.cache import cache
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect
 from django.utils import timezone
+from redis.exceptions import RedisError
 
 from .models import get_website_visibility
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_RATE_LIMIT_RULES = {
@@ -52,6 +57,15 @@ class SensitiveEndpointRateLimitMiddleware:
         response['Retry-After'] = str(window_seconds)
         return response
 
+    def _cache_unavailable_response(self, request, window_seconds):
+        message = 'Request limiting is temporarily unavailable. Please retry shortly.'
+        if request.path.startswith('/assistant/') or request.headers.get('x-requested-with') == 'XMLHttpRequest':
+            response = JsonResponse({'success': False, 'message': message}, status=503)
+        else:
+            response = HttpResponse(message, status=503)
+        response['Retry-After'] = str(window_seconds)
+        return response
+
     def __call__(self, request):
         rules = getattr(settings, 'RATE_LIMIT_RULES', DEFAULT_RATE_LIMIT_RULES)
         path = request.path_info or request.path or '/'
@@ -67,16 +81,23 @@ class SensitiveEndpointRateLimitMiddleware:
             window = int(rule.get('window', 60))
             scope = rule.get('scope', 'ip')
             bucket = self._rate_limit_key(rule_name, request, scope)
-            if cache.add(bucket, 1, timeout=window):
-                count = 1
-            else:
-                try:
-                    count = cache.incr(bucket)
-                except ValueError:
-                    if cache.add(bucket, 1, timeout=window):
-                        count = 1
-                    else:
+            try:
+                if cache.add(bucket, 1, timeout=window):
+                    count = 1
+                else:
+                    try:
                         count = cache.incr(bucket)
+                    except ValueError:
+                        if cache.add(bucket, 1, timeout=window):
+                            count = 1
+                        else:
+                            count = cache.incr(bucket)
+            except (RedisError, ValueError):
+                logger.exception(
+                    'Redis-backed rate limiting failed for rule %s; rejecting request.',
+                    rule_name,
+                )
+                return self._cache_unavailable_response(request, window)
             if count > limit:
                 return self._rate_limit_response(request, window)
         return self.get_response(request)

@@ -11,7 +11,9 @@ from django.contrib.admin.widgets import FilteredSelectMultiple
 from django.conf import settings
 from django.contrib.auth.models import Group, Permission
 from django.core.cache import cache
+from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
+from django.http import HttpResponse
 from django.test import Client, RequestFactory, SimpleTestCase, TestCase, override_settings
 from django.urls import resolve, reverse
 from django.utils import timezone
@@ -40,8 +42,81 @@ from .models import (
 from .services.credential_vault import decrypt_secret, encrypt_secret
 from .services.file_storage import local_file_path
 
+from global_opportunity_agent.settings import _validated_redis_url
+from .middleware import SensitiveEndpointRateLimitMiddleware
+from redis.exceptions import ConnectionError as RedisConnectionError
+
 
 User = get_user_model()
+
+
+class RedisConfigurationTests(SimpleTestCase):
+    def test_redis_urls_require_a_supported_scheme_and_host(self):
+        self.assertEqual(
+            _validated_redis_url('REDIS_URL', 'rediss://cache.example:6380/0'),
+            'rediss://cache.example:6380/0',
+        )
+
+        for value in ('cache.example:6379', 'http://cache.example:6379', 'redis://'):
+            with self.subTest(value=value):
+                with self.assertRaisesMessage(
+                    ImproperlyConfigured,
+                    'REDIS_URL must be a valid Redis URL using redis:// or rediss://.',
+                ):
+                    _validated_redis_url('REDIS_URL', value)
+
+    def test_rate_limited_requests_fail_closed_when_redis_is_unavailable(self):
+        rules = {
+            'search': {
+                'limit': 60,
+                'window': 60,
+                'methods': {'GET'},
+                'paths': ('/opportunities/',),
+            },
+            'assistant': {
+                'limit': 30,
+                'window': 60,
+                'methods': {'POST'},
+                'paths': ('/assistant/new/',),
+            },
+        }
+        middleware = SensitiveEndpointRateLimitMiddleware(
+            lambda request: HttpResponse('view reached'),
+        )
+
+        cache_failures = (
+            RedisConnectionError('connection refused'),
+            ValueError('Redis URL must specify a supported scheme'),
+        )
+        with override_settings(RATE_LIMIT_RULES=rules):
+            for method, path in (
+                ('get', '/opportunities/'),
+                ('post', '/assistant/new/'),
+            ):
+                for cache_failure in cache_failures:
+                    with self.subTest(path=path, error=type(cache_failure).__name__):
+                        request = getattr(RequestFactory(), method)(path)
+                        with patch(
+                            'opportunity_agent.middleware.cache.add',
+                            side_effect=cache_failure,
+                        ):
+                            with self.assertLogs(
+                                'opportunity_agent.middleware',
+                                level='ERROR',
+                            ) as captured:
+                                response = middleware(request)
+
+                        self.assertEqual(response.status_code, 503)
+                        self.assertNotContains(
+                            response,
+                            str(cache_failure),
+                            status_code=503,
+                        )
+                        self.assertIn(
+                            'Traceback (most recent call last)',
+                            captured.output[0],
+                        )
+                        self.assertIn(str(cache_failure), captured.output[0])
 
 
 class ServerErrorLoggingTests(SimpleTestCase):
